@@ -373,7 +373,7 @@ def run_nsga2(state):
         NSGA2(pop_size=60, sampling=FloatRandomSampling(),
               crossover=SBX(prob=0.9, eta=15),
               mutation=PM(eta=20), eliminate_duplicates=True),
-        termination=("n_gen", 40), seed=1, verbose=False
+        termination=("n_gen", 40), seed=None, verbose=False
     )
     return result.X, result.F
 
