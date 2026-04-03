@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pandas as pd
 
-# Fixed import path: importing directly from bms_pipeline
+# Importing directly from your src folder
 from src.bms_pipeline import (
     BatteryTransformer,
     run_predictor,
@@ -74,21 +74,17 @@ if st.sidebar.button("Run Simulation", type="primary"):
             "cycle_norm": 0.5
         }
 
-        # 1. PREDICTOR
+        # 1. PREDICTOR (Overrides Removed! AI is now in control)
         predictor_output = run_predictor(battery_input, model, global_mean, global_std, device)
-        # FORCE the predictor to obey the UI sliders:
-
-
 
         # 2. SIMULATOR
         df, transformer_state = run_simulator_optimiser(predictor_output)
         transformer_state["confidence"] = predictor_output["confidence"]
 
-        # >>> PATCH 1: SAFETY CHECK PREVENTS KEYERROR CRASH <<<
+        # SAFETY CHECK (Prevents KeyError if extreme states cause all simulations to fail)
         if df.empty or "solution_id" not in df.columns:
             st.error("🚨 Critical Safety Abort: The battery state is too extreme. The simulator could not find any safe charging profiles to generate a dataset.")
             st.stop() 
-        # >>> ---------------------------------------------- <<<
 
         # 3. META-AGENT
         selected_policy, policies, metrics_df, policy_choices = run_meta_agent(
@@ -108,6 +104,7 @@ if st.sidebar.button("Run Simulation", type="primary"):
     st.divider()
     
     col1, col2, col3, col4 = st.columns(4)
+    # These metrics now display the AI's actual predictions!
     col1.metric("Predicted SoC", f"{predictor_output['soc']:.2%}")
     col2.metric("Predicted SoH", f"{predictor_output['soh']:.2%}")
     col3.metric("Predicted Temp", f"{predictor_output['temperature']:.1f} °C")
@@ -129,18 +126,17 @@ if st.sidebar.button("Run Simulation", type="primary"):
         current_soh = predictor_output['soh']
         end_of_life_threshold = 0.80
         
-        # >>> PATCH 2: FIXES THE RUL == 0 ISSUE <<<
         st.subheader("🔋 Lifecycle & RUL Analysis")
         c1, c2, c3 = st.columns(3)
         c1.metric("Selected Policy ID", int(final_policy))
         c2.metric("Cycle SoH Degradation", f"{soh_loss_per_cycle:.6f}")
         
+        # Prevent Divide-by-Zero if the battery takes no damage
         if soh_loss_per_cycle > 0 and current_soh > end_of_life_threshold:
             projected_rul_cycles = int((current_soh - end_of_life_threshold) / soh_loss_per_cycle)
             c3.metric("Estimated RUL (Cycles)", projected_rul_cycles, help="Cycles remaining until SoH hits 80%")
         else:
             c3.metric("Estimated RUL", "Infinite (No Damage)")
-        # >>> --------------------------------- <<<
 
         st.divider()
         st.subheader("📈 Live Charging Simulation")
