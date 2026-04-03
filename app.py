@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 # Fixed import path: importing directly from bms_pipeline
-from bms_pipeline import (
+from src.bms_pipeline import (
     BatteryTransformer,
     run_predictor,
     run_simulator_optimiser,
