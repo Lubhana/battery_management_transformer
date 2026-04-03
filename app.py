@@ -1,8 +1,18 @@
 import streamlit as st
-import subprocess
+import torch
+import pickle
+import os
+
+# Import functions from your pipeline file
+from bms_pipeline import (
+    BatteryTransformer,
+    run_predictor,
+    run_simulator_optimiser,
+    run_meta_agent,
+    run_kill_agent
+)
 
 st.set_page_config(page_title="BMS AI System", layout="centered")
-
 st.title("🔋 Battery Management System")
 
 # -----------------------
@@ -19,32 +29,69 @@ mode = st.selectbox(
 )
 
 # -----------------------
+# PATHS (relative)
+# -----------------------
+MODEL_PATH = "models/best_model.pt"
+GLOBALS_PATH = "models/predictor_globals.pkl"
+
+# -----------------------
 # RUN PIPELINE
 # -----------------------
 if st.button("Run Pipeline"):
 
-    with st.spinner("Running full BMS pipeline..."):
+    with st.spinner("Running AI pipeline..."):
 
-        cmd = [
-            "python", "predict.py",
-            "--soc", str(soc),
-            "--soh", str(soh),
-            "--temp", str(temp),
-            "--current", str(current),
-            "--mode", mode
-        ]
+        device = torch.device("cpu")
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Load model
+        model = BatteryTransformer(input_dim=11).to(device)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+
+        # Load globals
+        with open(GLOBALS_PATH, "rb") as f:
+            globs = pickle.load(f)
+
+        global_mean = globs["global_mean"]
+        global_std = globs["global_std"]
+
+        battery_input = {
+            "soc": soc,
+            "soh": soh,
+            "temp_C": temp,
+            "current_A": current,
+            "cycle_norm": 0.5
+        }
+
+        # ---- AGENT 1
+        predictor_output = run_predictor(
+            battery_input, model, global_mean, global_std, device
+        )
+
+        # ---- AGENT 2
+        df, transformer_state = run_simulator_optimiser(predictor_output)
+
+        transformer_state["confidence"] = predictor_output["confidence"]
+
+        # ---- AGENT 3
+        selected_policy, policies, metrics_df, policy_choices = run_meta_agent(
+            df, transformer_state, mode=mode
+        )
+
+        # ---- AGENT 4
+        final_policy, decision = run_kill_agent(
+            df, selected_policy, transformer_state, policies, metrics_df
+        )
 
     st.success("Done ✅")
 
     # -----------------------
     # OUTPUT
     # -----------------------
-    st.subheader("Pipeline Output")
+    st.subheader("🔮 Predictor Output")
+    st.write(predictor_output)
 
-    if result.stdout:
-        st.text(result.stdout)
+    st.subheader("🧠 Decision")
+    st.write(decision)
 
-    if result.stderr:
-        st.error(result.stderr)
+    st.subheader("⚡ Final Policy")
+    st.write(final_policy)
