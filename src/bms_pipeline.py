@@ -33,7 +33,11 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS  — edit these to match your Kaggle/local environment
 # ─────────────────────────────────────────────────────────────────────────────
+
 import os
+
+os.makedirs(os.path.dirname(DATASET_PATH), exist_ok=True)
+df.to_csv(DATASET_PATH, index=False)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -429,6 +433,7 @@ def run_simulator_optimiser(predictor_output):
     if os.path.exists(DATASET_PATH):
         section("Loading existing nsga2_synthetic_dataset.csv")
         df = pd.read_csv(DATASET_PATH)
+        
         print(f"  Loaded {len(df):,} rows | {df['solution_id'].nunique()} solutions")
         pareto_profiles = None   # not needed — dataset already built
     else:
@@ -451,8 +456,9 @@ def run_simulator_optimiser(predictor_output):
         print(f"    SoH loss range  : {soh_losses.min():.6f} — {soh_losses.max():.6f}")
 
         section("Building synthetic dataset")
-        df = build_synthetic_dataset(pareto_profiles, transformer_state)
+        df = build_synthetic_dataset(pareto_profiles, transformer_state)os.makedirs(os.path.dirname(DATASET_PATH), exist_ok=True)        
         df.to_csv(DATASET_PATH, index=False)
+
         print(f"  Saved {len(df):,} rows → {DATASET_PATH}")
 
     return df, transformer_state
