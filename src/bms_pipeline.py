@@ -119,8 +119,8 @@ class BatteryTransformer(nn.Module):
 
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     """
-    Builds a (seq_len, 11) feature tensor from a single battery state dict.
-    Calculations directly mirror the BatteryECM class from ECM.ipynb
+    Builds a (seq_len, 11) feature tensor by running a mini-ECM simulation 
+    to exactly match the Transformer's training distribution.
     """
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
@@ -201,11 +201,22 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # Extra features (not normalised)
-    mode_flag   = 1.0 if curr < 0 else 0.0
-    time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
-    cycle_index  = np.full((seq_len, 1), battery_input.get("cycle_norm", 0.5))
-    mode_col     = np.full((seq_len, 1), mode_flag)
+    # --- THE FINAL FIX: REALISTIC TIME & AGE VARIABLES ---
+    mode_flag = 1.0 if curr < 0 else 0.0
+    mode_col  = np.full((seq_len, 1), mode_flag)
+    
+    # 1. Time_uniform: If SoC is 45%, we are 55% through a discharge cycle. 
+    # 64 seconds is only ~0.017 of a 1-hour cycle.
+    start_tu = np.clip(1.0 - soc, 0.0, 1.0)
+    end_tu = np.clip(start_tu + (seq_len * dt / 3600.0), 0.0, 1.0)
+    time_uniform = np.linspace(start_tu, end_tu, seq_len).reshape(-1, 1)
+    
+    # 2. cycle_index: Map directly to SoH slider! 
+    # In NASA data, SoH drops from 1.0 to 0.7 as cycle_index goes 0 to 1.
+    # So if SoH is 0.95, cycle_index becomes ~0.16. 
+    c_index = np.clip((1.0 - soh) * 3.33, 0.0, 1.0)
+    cycle_index = np.full((seq_len, 1), c_index)
+    # -----------------------------------------------------
 
     # Exact feature order matching Transformer training
     features = np.concatenate([
