@@ -395,30 +395,25 @@ def build_synthetic_dataset(pareto_profiles, state):
                 "SoH":           soh_t[t],
             })
     return pd.DataFrame(rows)
-
 def run_simulator_optimiser(predictor_output):
     banner("AGENT 2 — SIMULATOR + OPTIMISER")
-    
-    # If SoC is already 1.0, the simulator might fail to find "charging" profiles
-    soc_val = predictor_output["soc"]
-    
-    if os.path.exists(DATASET_PATH):
-        df = pd.read_csv(DATASET_PATH)
-        # Filter profiles that are relevant to current SoC
-        # If df is empty after filtering, we need a fallback
-        if df.empty:
-            print("Warning: Dataset is empty. Generating fallback row.")
-            df = pd.DataFrame([{"solution_id": 0, "SoC": soc_val, "SoH": predictor_output["soh"]}])
-    else:
-        # Generate dummy data if file is missing
-        df = pd.DataFrame({"solution_id": [1], "SoC": [soc_val], "SoH": [0.99]})
-        
+
     transformer_state = {
-        "soc": soc_val,
-        "soh": predictor_output["soh"],
-        "temp": predictor_output["temperature"] + 273.15,
+        "soc":        predictor_output["soc"],
+        "soh":        predictor_output["soh"],
+        "temp":       predictor_output["temperature"] + 273.15,
         "confidence": predictor_output["confidence"],
     }
+
+    section("NSGA-II multi-objective optimisation")
+    print("  Running NSGA-II (40 generations, 60 individuals)...")
+    
+    # Run the optimizer to generate actual data
+    pareto_profiles, pareto_F = run_nsga2(transformer_state)
+    
+    section("Building synthetic dataset")
+    df = build_synthetic_dataset(pareto_profiles, transformer_state)
+    
     return df, transformer_state
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,20 +565,50 @@ def kill_agent(policy_metrics, battery_state,
 
     return {"decision": "allow", "reason": "policy safe"}, checks
 
-
-def run_kill_agent(selected_policy, state):
+def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df):
     banner("AGENT 4 — KILL AGENT")
-    
-    # Check 1: Overheating (330K is ~56°C)
-    if state["temp"] > 330:
-        return selected_policy, {"decision": "abort", "reason": "overheating"}
-    
-    # Check 2: Overcharge Prevention
-    if state["soc"] >= 0.99:
-        return selected_policy, {"decision": "abort", "reason": "battery full - cannot charge"}
 
-    return selected_policy, {"decision": "allow", "reason": "safe"}
+    battery_state = {
+        "soc":        transformer_state["soc"],
+        "soh":        transformer_state["soh"],
+        "temp":       transformer_state["temp"],
+        "confidence": transformer_state.get("confidence", 1.0),
+    }
 
+    policy  = extract_policy(df, selected_policy)
+    metrics = compute_metrics(policy)
+
+    section("Policy safety metrics")
+    for k, v in metrics.items():
+        print(f"  {k:<22}: {v:.6f}")
+
+    decision, checks = kill_agent(metrics, battery_state)
+
+    # resolve final policy
+    if decision["decision"] == "allow":
+        final_policy = selected_policy
+        print(f"\n  Final policy : {int(final_policy)} — APPROVED")
+    elif decision["decision"] == "override":
+        # Find safest approved policy
+        safe_candidates = []
+        for pid in df["solution_id"].unique():
+            pol  = extract_policy(df, pid)
+            mets = compute_metrics(pol)
+            dec, _ = kill_agent(mets, battery_state)
+            if dec["decision"] == "allow":
+                safe_candidates.append((pid, mets["soh_loss"]))
+
+        if safe_candidates:
+            final_policy = min(safe_candidates, key=lambda x: x[1])[0]
+            print(f"\n  Override → safest approved policy: {int(final_policy)}")
+        else:
+            final_policy = None
+            print("\n  Override → no safe policy found")
+    else:  
+        final_policy = None
+        print("\n  ABORT — charging stopped")
+
+    return final_policy, decision
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FINAL OUTPUT
