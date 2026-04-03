@@ -77,9 +77,8 @@ if st.sidebar.button("Run Simulation", type="primary"):
         # 1. PREDICTOR
         predictor_output = run_predictor(battery_input, model, global_mean, global_std, device)
         # FORCE the predictor to obey the UI sliders:
-        predictor_output['soc'] = soc
-        predictor_output['soh'] = soh
-        predictor_output['temperature'] = temp
+
+
 
         # 2. SIMULATOR
         df, transformer_state = run_simulator_optimiser(predictor_output)
