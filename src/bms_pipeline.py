@@ -400,7 +400,6 @@ def build_synthetic_dataset(pareto_profiles, state):
 def run_simulator_optimiser(predictor_output):
     banner("AGENT 2 — SIMULATOR + OPTIMISER")
 
-    # temperature: Predictor outputs Celsius, Simulator uses Kelvin
     transformer_state = {
         "soc":        predictor_output["soc"],
         "soh":        predictor_output["soh"],
@@ -408,49 +407,31 @@ def run_simulator_optimiser(predictor_output):
         "confidence": predictor_output["confidence"],
     }
 
-    section("Simulator — ECM physics check")
-    test_profile = np.full(60, 1.5)   # 1-minute test at 1.5A
-    test_result  = simulate_charging(test_profile, transformer_state, BATTERY_PARAMS)
-    if test_result:
-        _, peak_t, soh_loss, final_soc = test_result
-        print(f"  1-min test sim at 1.5A:")
-        print(f"    Final SoC  : {final_soc:.4f}")
-        print(f"    Peak temp  : {peak_t:.2f} K")
-        print(f"    SoH loss   : {soh_loss:.6f}")
-    else:
-        print("  Test simulation hit safety limit — battery state extreme")
+    # --- REMOVED the if os.path.exists() check here ---
 
-    # ── check if dataset already exists ──────────────────────────────────────
-    if os.path.exists(DATASET_PATH):
-        section("Loading existing nsga2_synthetic_dataset.csv")
-        df = pd.read_csv(DATASET_PATH)
-        print(f"  Loaded {len(df):,} rows | {df['solution_id'].nunique()} solutions")
-        pareto_profiles = None   # not needed — dataset already built
-    else:
-        section("GA optimisation")
-        best_ga = run_ga(transformer_state)
-        res_ga  = simulate_charging(best_ga, transformer_state, BATTERY_PARAMS)
-        if res_ga:
-            _, _, _, best_soc = res_ga
-            print(f"\n  GA best profile → final SoC: {best_soc:.4f}")
+    section("GA optimisation")
+    best_ga = run_ga(transformer_state)
+    res_ga  = simulate_charging(best_ga, transformer_state, BATTERY_PARAMS)
+    if res_ga:
+        _, _, _, best_soc = res_ga
+        print(f"\n  GA best profile → final SoC: {best_soc:.4f}")
 
-        section("NSGA-II multi-objective optimisation")
-        print("  Running NSGA-II (40 generations, 60 individuals)...")
-        pareto_profiles, pareto_F = run_nsga2(transformer_state)
-        soc_gains  = -pareto_F[:, 0]
-        peak_temps =  pareto_F[:, 1]
-        soh_losses =  pareto_F[:, 2]
-        print(f"  Pareto front: {len(pareto_profiles)} solutions")
-        print(f"    SoC gain range  : {soc_gains.min():.4f} — {soc_gains.max():.4f}")
-        print(f"    Peak temp range : {peak_temps.min():.2f} — {peak_temps.max():.2f} K")
-        print(f"    SoH loss range  : {soh_losses.min():.6f} — {soh_losses.max():.6f}")
+    section("NSGA-II multi-objective optimisation")
+    print("  Running NSGA-II (40 generations, 60 individuals)...")
+    pareto_profiles, pareto_F = run_nsga2(transformer_state)
+    
+    # ... (keep the rest of the print statements) ...
 
-        section("Building synthetic dataset")
-        df = build_synthetic_dataset(pareto_profiles, transformer_state)
-        df.to_csv(DATASET_PATH, index=False)
-        print(f"  Saved {len(df):,} rows → {DATASET_PATH}")
+    section("Building synthetic dataset")
+    df = build_synthetic_dataset(pareto_profiles, transformer_state)
+    
+    # Optional: You can still save it to CSV for debugging, 
+    # it will just overwrite the old file each time.
+    df.to_csv(DATASET_PATH, index=False) 
+    print(f"  Saved {len(df):,} rows → {DATASET_PATH}")
 
     return df, transformer_state
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
