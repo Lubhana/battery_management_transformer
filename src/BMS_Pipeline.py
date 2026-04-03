@@ -33,10 +33,14 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS  — edit these to match your Kaggle/local environment
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_PATH   = "/Users/arujatiwary/Desktop/BMS/codes/best_model.pt"
-GLOBALS_PATH = "/Users/arujatiwary/Desktop/BMS/codes/predictor_globals.pkl"
-DATASET_PATH = "/Users/arujatiwary/Desktop/BMS/codes/nsga2_synthetic_dataset.csv"
-DATA_DIR     = "/Users/arujatiwary/Desktop/ECM_processed_cycles"
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_PATH   = os.path.join(BASE_DIR, "models", "best_model.pt")
+GLOBALS_PATH = os.path.join(BASE_DIR, "models", "predictor_globals.pkl")
+DATASET_PATH = os.path.join(BASE_DIR, "dataset", "nsga2_synthetic_dataset.csv")
+DATA_DIR     = os.path.join(BASE_DIR, "data", "ECM_processed_cycles")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
