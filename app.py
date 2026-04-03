@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pandas as pd
 
-# Fixed import path: importing directly from bms_pipeline
+# Importing directly from your src folder
 from src.bms_pipeline import (
     BatteryTransformer,
     run_predictor,
@@ -76,6 +76,7 @@ if st.sidebar.button("Run Simulation", type="primary"):
 
         # 1. PREDICTOR
         predictor_output = run_predictor(battery_input, model, global_mean, global_std, device)
+        
         # FORCE the predictor to obey the UI sliders:
         predictor_output['soc'] = soc
         predictor_output['soh'] = soh
@@ -85,7 +86,7 @@ if st.sidebar.button("Run Simulation", type="primary"):
         df, transformer_state = run_simulator_optimiser(predictor_output)
         transformer_state["confidence"] = predictor_output["confidence"]
 
-        # >>> PATCH 1: SAFETY CHECK PREVENTS KEYERROR CRASH <<<
+        # >>> SAFETY CHECK PREVENTS KEYERROR CRASH <<<
         if df.empty or "solution_id" not in df.columns:
             st.error("🚨 Critical Safety Abort: The battery state is too extreme. The simulator could not find any safe charging profiles to generate a dataset.")
             st.stop() 
@@ -130,7 +131,7 @@ if st.sidebar.button("Run Simulation", type="primary"):
         current_soh = predictor_output['soh']
         end_of_life_threshold = 0.80
         
-        # >>> PATCH 2: FIXES THE RUL == 0 ISSUE <<<
+        # >>> FIXES THE RUL == 0 ISSUE <<<
         st.subheader("🔋 Lifecycle & RUL Analysis")
         c1, c2, c3 = st.columns(3)
         c1.metric("Selected Policy ID", int(final_policy))
