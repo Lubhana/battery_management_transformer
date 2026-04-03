@@ -1,55 +1,50 @@
 import streamlit as st
-import numpy as np
+import subprocess
 
-# Import your prediction function
-# (you will implement this in src/inference/predict.py)
-from src.inference.predict import predict
+st.set_page_config(page_title="BMS AI System", layout="centered")
 
-# -------------------------------
-# UI TITLE
-# -------------------------------
-st.set_page_config(page_title="Battery BMS AI", layout="centered")
+st.title("🔋 Battery Management System")
 
-st.title("🔋 Battery Management System (AI)")
-st.write("Predict battery health / anomalies using AI model")
+# -----------------------
+# INPUTS
+# -----------------------
+soc = st.slider("SoC", 0.0, 1.0, 0.45)
+soh = st.slider("SoH", 0.0, 1.0, 0.95)
+temp = st.number_input("Temperature (°C)", value=27.0)
+current = st.number_input("Current (A)", value=-1.5)
 
-# -------------------------------
-# USER INPUT SECTION
-# -------------------------------
-st.header("Input Parameters")
+mode = st.selectbox(
+    "Mode",
+    ["auto", "fast", "balanced", "battery_care"]
+)
 
-voltage = st.number_input("Voltage (V)", min_value=0.0, value=3.7)
-current = st.number_input("Current (A)", value=1.0)
-temperature = st.number_input("Temperature (°C)", value=25.0)
+# -----------------------
+# RUN PIPELINE
+# -----------------------
+if st.button("Run Pipeline"):
 
-# Example additional inputs (modify based on your dataset)
-soc = st.slider("State of Charge (SOC %)", 0, 100, 50)
+    with st.spinner("Running full BMS pipeline..."):
 
-# Convert input to array
-input_data = np.array([voltage, current, temperature, soc])
+        cmd = [
+            "python", "predict.py",
+            "--soc", str(soc),
+            "--soh", str(soh),
+            "--temp", str(temp),
+            "--current", str(current),
+            "--mode", mode
+        ]
 
-# -------------------------------
-# PREDICTION BUTTON
-# -------------------------------
-if st.button("Predict"):
-    try:
-        result = predict(input_data)
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
-        st.success("Prediction complete ✅")
+    st.success("Done ✅")
 
-        st.subheader("Result:")
-        st.write(result)
+    # -----------------------
+    # OUTPUT
+    # -----------------------
+    st.subheader("Pipeline Output")
 
-    except Exception as e:
-        st.error(f"Error: {e}")
+    if result.stdout:
+        st.text(result.stdout)
 
-# -------------------------------
-# OPTIONAL VISUALIZATION
-# -------------------------------
-st.subheader("Input Summary")
-st.write({
-    "Voltage": voltage,
-    "Current": current,
-    "Temperature": temperature,
-    "SOC": soc
-})
+    if result.stderr:
+        st.error(result.stderr)
