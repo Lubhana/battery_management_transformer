@@ -284,25 +284,38 @@ def degradation_step(soh, current, temp, dt):
     stress = abs(current) * max(0.0, temp - 298.0)
     return max(0.0, soh - 5e-9 * stress * dt)
 
-
 def simulate_charging(profile, state, params, log_trajectory=False):
     soc, soh, temp = state["soc"], state["soh"], state["temp"]
     dt = params["dt"]
     soc_t, temp_t, soh_t = [], [], []
+    actual_profile = [] # Track the clipped current
 
     for current in profile:
+        # --- SMART CHARGER FIX (CC-CV Emulation) ---
+        # Check if current would push voltage over V_max
+        ocv = ocv_function(soc)
+        R0 = params["R0_nominal"] * (1.0 / max(soh, 0.01))
+        
+        if ocv + abs(current) * R0 > params["V_max"]:
+            # Clip current so it gracefully holds at V_max instead of crashing
+            current = max(0.0, (params["V_max"] - ocv) / R0)
+        # -------------------------------------------
+
         soc, voltage, R0 = ecm_step(soc, soh, current, dt, params)
         temp = thermal_step(temp, current, R0, params, dt)
         soh  = degradation_step(soh, current, temp, dt)
-        if voltage > params["V_max"] or temp > params["T_max"]:
-            return None
+        
+        if temp > params["T_max"]:
+            return None # Still abort if it overheats
+
         if log_trajectory:
             soc_t.append(soc); temp_t.append(temp); soh_t.append(soh)
+            actual_profile.append(current) # Save the real applied current
 
     charging_time = len(profile) * dt
     soh_loss      = state["soh"] - soh
     if log_trajectory:
-        return charging_time, soh_loss, soc_t, temp_t, soh_t
+        return charging_time, soh_loss, soc_t, temp_t, soh_t, actual_profile
     return charging_time, temp, soh_loss, soc
 
 
@@ -384,17 +397,22 @@ def build_synthetic_dataset(pareto_profiles, state):
         res = simulate_charging(profile, state, BATTERY_PARAMS, log_trajectory=True)
         if res is None:
             continue
-        _, _, soc_t, temp_t, soh_t = res
-        for t in range(len(profile)):
+            
+        # Unpack the new actual_profile from the Smart Charger fix
+        _, _, soc_t, temp_t, soh_t, actual_profile = res
+        
+        for t in range(len(actual_profile)):
             rows.append({
                 "solution_id":   sol_id,
                 "time_s":        t,
-                "current_A":     profile[t],
+                "current_A":     actual_profile[t], # Use the safe, clipped current
                 "SoC":           soc_t[t],
                 "temperature_K": temp_t[t],
                 "SoH":           soh_t[t],
             })
     return pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+  
 def run_simulator_optimiser(predictor_output):
     banner("AGENT 2 — SIMULATOR + OPTIMISER")
 
@@ -408,7 +426,7 @@ def run_simulator_optimiser(predictor_output):
     section("NSGA-II multi-objective optimisation")
     print("  Running NSGA-II (40 generations, 60 individuals)...")
     
-    # Run the optimizer to generate actual data
+    # Run the optimizer to generate the dataset dynamically
     pareto_profiles, pareto_F = run_nsga2(transformer_state)
     
     section("Building synthetic dataset")
