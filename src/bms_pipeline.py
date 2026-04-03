@@ -121,12 +121,14 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     """
     Builds a (seq_len, 11) feature tensor from a single battery state dict.
     In production this would come from real sensor readings.
+    Here we construct a plausible sequence from the given scalar inputs.
     """
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
         'V_RC_masked', 'V_ECM_masked', 'power', 'Temperature_measured'
     ]
 
+    # Build synthetic sequence — constant values with tiny noise
     soc   = battery_input["soc"]
     temp  = battery_input["temp_C"]      # Celsius
     curr  = battery_input["current_A"]   # negative = discharge
@@ -134,31 +136,16 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     rows = []
     for t in range(seq_len):
-        # --- SMART PHYSICS SIMULATION FIX ---
-        progress = t / seq_len 
-        
-        if curr < 0: # Discharging: Voltage drops, Temp rises
-            sim_volt = volt - (0.05 * progress) 
-            sim_temp = temp + (1.5 * progress)
-            dv_dt = -0.0008
-            dt_dt = 0.02
-        else: # Charging: Voltage rises, Temp rises faster
-            sim_volt = volt + (0.05 * progress)
-            sim_temp = temp + (2.5 * progress)
-            dv_dt = 0.0008
-            dt_dt = 0.04
-        # ------------------------------------
-
         noise = np.random.normal(0, 0.001, 8)
         row = np.array([
-            sim_volt + noise[0],       # Voltage_measured
+            volt  + noise[0],          # Voltage_measured
             curr  + noise[1],          # Current_measured
-            dv_dt + noise[2],          # dV_dt
-            dt_dt + noise[3],          # dT_dt
-            0.0   + noise[4],          # V_RC_masked
+            noise[2],                  # dV_dt
+            noise[3],                  # dT_dt
+            0.0   + noise[4],          # V_RC_masked (discharge only)
             0.0   + noise[5],          # V_ECM_masked
-            sim_volt * curr + noise[6],# power
-            sim_temp  + noise[7],      # Temperature_measured
+            volt * curr + noise[6],    # power
+            temp  + noise[7],          # Temperature_measured
         ])
         rows.append(row)
 
@@ -176,6 +163,8 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     mode_col     = np.full((seq_len, 1), mode_flag)
 
     # final feature order matches BatteryDataset:
+    # Voltage, Current, Time_uniform, dV_dt, dT_dt,
+    # mode_flag, V_RC_masked, V_ECM_masked, power, cycle_index, Temperature
     features = np.concatenate([
         data_norm[:, 0:1],   # Voltage_measured
         data_norm[:, 1:2],   # Current_measured
@@ -231,6 +220,7 @@ def run_predictor(battery_input, model, global_mean, global_std, device):
         "soh":        np.clip(soh_mu, 0.0, 1.0),
         "temperature": temp_real,
         "confidence": avg_conf,
+        # per-target confidences
         "soc_conf":   soc_conf,
         "soh_conf":   soh_conf,
         "temp_conf":  temp_conf,
@@ -294,14 +284,14 @@ def degradation_step(soh, current, temp, dt):
     stress = abs(current) * max(0.0, temp - 298.0)
     return max(0.0, soh - 5e-9 * stress * dt)
 
-
 def simulate_charging(profile, state, params, log_trajectory=False):
     soc, soh, temp = state["soc"], state["soh"], state["temp"]
     dt = params["dt"]
     soc_t, temp_t, soh_t = [], [], []
-    actual_profile = [] 
+    actual_profile = [] # Track the clipped current
 
     for current in profile:
+        # --- SMART CHARGER FIX (CC-CV Emulation) ---
         # Check if current would push voltage over V_max
         ocv = ocv_function(soc)
         R0 = params["R0_nominal"] * (1.0 / max(soh, 0.01))
@@ -309,6 +299,7 @@ def simulate_charging(profile, state, params, log_trajectory=False):
         if ocv + abs(current) * R0 > params["V_max"]:
             # Clip current so it gracefully holds at V_max instead of crashing
             current = max(0.0, (params["V_max"] - ocv) / R0)
+        # -------------------------------------------
 
         soc, voltage, R0 = ecm_step(soc, soh, current, dt, params)
         temp = thermal_step(temp, current, R0, params, dt)
@@ -319,7 +310,7 @@ def simulate_charging(profile, state, params, log_trajectory=False):
 
         if log_trajectory:
             soc_t.append(soc); temp_t.append(temp); soh_t.append(soh)
-            actual_profile.append(current) 
+            actual_profile.append(current) # Save the real applied current
 
     charging_time = len(profile) * dt
     soh_loss      = state["soh"] - soh
@@ -407,17 +398,19 @@ def build_synthetic_dataset(pareto_profiles, state):
         if res is None:
             continue
             
+        # Unpack the new actual_profile from the Smart Charger fix
         _, _, soc_t, temp_t, soh_t, actual_profile = res
         
         for t in range(len(actual_profile)):
             rows.append({
                 "solution_id":   sol_id,
                 "time_s":        t,
-                "current_A":     actual_profile[t], 
+                "current_A":     actual_profile[t], # Use the safe, clipped current
                 "SoC":           soc_t[t],
                 "temperature_K": temp_t[t],
                 "SoH":           soh_t[t],
             })
+    return pd.DataFrame(rows)
     return pd.DataFrame(rows)
   
 def run_simulator_optimiser(predictor_output):
@@ -440,7 +433,6 @@ def run_simulator_optimiser(predictor_output):
     df = build_synthetic_dataset(pareto_profiles, transformer_state)
     
     return df, transformer_state
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 3 — META-AGENT
@@ -590,7 +582,6 @@ def kill_agent(policy_metrics, battery_state,
         return {"decision": "override", "reason": "predictor uncertainty"},         checks
 
     return {"decision": "allow", "reason": "policy safe"}, checks
-
 
 def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df):
     banner("AGENT 4 — KILL AGENT")
