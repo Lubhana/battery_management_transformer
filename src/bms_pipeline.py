@@ -134,10 +134,17 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     # Base ECM parameters matched to ECM.ipynb
     Q_rated = 2.3  
-    R0 = 0.02
     R1 = 0.01
     C1 = 2000.0
     dt = 1.0
+
+    # --- AI PHYSICS FIXES ---
+    # 1. R0 Scaling: Resistance MUST increase as SoH drops so the AI sees the voltage sag
+    R0 = 0.02 * (1.0 / max(soh, 0.01))
+    
+    # 2. Temperature Translation: Map the slider down to the NASA dataset's native scale
+    temp_mean_nasa = float(global_mean["Temperature_measured"]) 
+    current_temp = temp_mean_nasa + (temp - 27.0)
 
     # Adjust Capacity for SoH
     Q_actual = Q_rated * max(soh, 0.01)
@@ -151,7 +158,6 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     # Initialize States
     current_soc = soc
-    current_temp = temp
     V_RC = 0.0
     prev_volt = ocv_function(current_soc) - I_load * R0
 
@@ -190,7 +196,7 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
             V_RC,             # V_RC_masked
             V_ecm,            # V_ECM_masked
             power,            # power
-            current_temp,     # Temperature_measured
+            current_temp,     # Temperature_measured (in NASA scale)
         ])
         rows.append(row)
 
@@ -201,23 +207,20 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # --- THE FINAL FIX: REALISTIC TIME & AGE VARIABLES ---
-    mode_flag = 1.0 if curr < 0 else 0.0
-    mode_col  = np.full((seq_len, 1), mode_flag)
-    
-    # 1. Time_uniform: If SoC is 45%, we are 55% through a discharge cycle. 
-    # 64 seconds is only ~0.017 of a 1-hour cycle.
+    # Extra features (not normalised)
+    mode_flag   = 1.0 if curr < 0 else 0.0
+    mode_col     = np.full((seq_len, 1), mode_flag)
+
+    # 3. Time_uniform: Match discharge progress properly
     start_tu = np.clip(1.0 - soc, 0.0, 1.0)
     end_tu = np.clip(start_tu + (seq_len * dt / 3600.0), 0.0, 1.0)
     time_uniform = np.linspace(start_tu, end_tu, seq_len).reshape(-1, 1)
-    
-    # 2. cycle_index: Map directly to SoH slider! 
-    # In NASA data, SoH drops from 1.0 to 0.7 as cycle_index goes 0 to 1.
-    # So if SoH is 0.95, cycle_index becomes ~0.16. 
-    c_index = np.clip((1.0 - soh) * 3.33, 0.0, 1.0)
-    cycle_index = np.full((seq_len, 1), c_index)
-    # -----------------------------------------------------
 
+    # 4. cycle_index: Map SoH (1.0 -> 0.70) to NASA's actual cycle count (1 -> 171)
+    estimated_cycle = int(((1.0 - soh) / 0.30) * 171)
+    estimated_cycle = np.clip(estimated_cycle, 1, 171)
+    cycle_index = np.full((seq_len, 1), estimated_cycle)
+    
     # Exact feature order matching Transformer training
     features = np.concatenate([
         data_norm[:, 0:1],   # Voltage_measured
@@ -268,6 +271,10 @@ def run_predictor(battery_input, model, global_mean, global_std, device):
     temp_mean = float(global_mean["Temperature_measured"])
     temp_std  = float(global_std["Temperature_measured"])
     temp_real = temp_mu * temp_std + temp_mean
+
+    # --- UI TRANSLATION ---
+    # Shift the AI's native NASA prediction back up to the Dashboard's 27°C scale
+    temp_real = temp_real + (27.0 - temp_mean)
 
     predictor_output = {
         "soc":        np.clip(soc_mu, 0.0, 1.0),
