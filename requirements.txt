@@ -1,4 +1,6 @@
-numpy<2.0
+streamlit
+numpy
 pandas
 torch
 pymoo
+scikit-learn
