@@ -1,52 +1,65 @@
-fix this code : import streamlit as st
+import streamlit as st
 import torch
 import pickle
 import os
-from src.bms_pipeline import BatteryTransformer, run_predictor, run_simulator_optimiser, run_meta_agent, run_kill_agent
-#import (
- #   BatteryTransformer,
-  #  run_predictor,
-   # run_simulator_optimiser,
-    #run_meta_agent,
-     #run_kill_agent
-#)
+import time
+import numpy as np
+import pandas as pd
 
-st.set_page_config(page_title="BMS AI System", layout="centered")
-st.title("🔋 Battery Management System")
-
-# -----------------------
-# INPUTS
-# -----------------------
-soc = st.slider("SoC", 0.0, 1.0, 0.45)
-soh = st.slider("SoH", 0.0, 1.0, 0.95)
-temp = st.number_input("Temperature (°C)", value=27.0)
-current = st.number_input("Current (A)", value=-1.5)
-
-mode = st.selectbox(
-    "Mode",
-    ["auto", "fast", "balanced", "battery_care"]
+# Fixed import path: importing directly from bms_pipeline
+from bms_pipeline import (
+    BatteryTransformer,
+    run_predictor,
+    run_simulator_optimiser,
+    run_meta_agent,
+    run_kill_agent,
+    extract_policy,
+    compute_metrics
 )
 
 # -----------------------
-# PATHS (relative)
+# PAGE CONFIG & STYLING
 # -----------------------
+st.set_page_config(page_title="BMS AI Simulation", page_icon="🔋", layout="wide")
+st.title("🔋 Continuous Battery Management System Simulator")
+st.markdown("Visualizing AI-driven charging policies, ECM states, and RUL estimation.")
+
+# -----------------------
+# SIDEBAR INPUTS
+# -----------------------
+st.sidebar.header("Initial Battery State")
+soc = st.sidebar.slider("SoC", 0.0, 1.0, 0.45)
+soh = st.sidebar.slider("SoH", 0.0, 1.0, 0.95)
+temp = st.sidebar.number_input("Temperature (°C)", value=27.0)
+current = st.sidebar.number_input("Initial Current (A)", value=-1.5)
+
+st.sidebar.header("Agent Settings")
+mode = st.sidebar.selectbox(
+    "Meta-Agent Mode",
+    ["auto", "fast", "balanced", "battery_care"]
+)
+
+# Paths (relative)
 MODEL_PATH = "models/best_model.pt"
 GLOBALS_PATH = "models/predictor_globals.pkl"
 
 # -----------------------
-# RUN PIPELINE
+# MAIN EXECUTION LOGIC
 # -----------------------
-if st.button("Run Pipeline"):
+if st.sidebar.button("Run Simulation", type="primary"):
+    
+    # Check if models exist before running
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(GLOBALS_PATH):
+        st.error(f"Missing model files. Please ensure {MODEL_PATH} and {GLOBALS_PATH} exist.")
+        st.stop()
 
-    with st.spinner("Running AI pipeline..."):
-
+    with st.spinner("Initializing Multi-Agent Pipeline..."):
         device = torch.device("cpu")
 
-        # Load model
+        # Load model and globals
         model = BatteryTransformer(input_dim=11).to(device)
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-
-        # Load globals
+        
         with open(GLOBALS_PATH, "rb") as f:
             globs = pickle.load(f)
 
@@ -61,36 +74,90 @@ if st.button("Run Pipeline"):
             "cycle_norm": 0.5
         }
 
-        # ---- AGENT 1
-        predictor_output = run_predictor(
-            battery_input, model, global_mean, global_std, device
-        )
+        # 1. PREDICTOR
+        predictor_output = run_predictor(battery_input, model, global_mean, global_std, device)
 
-        # ---- AGENT 2
+        # 2. SIMULATOR
         df, transformer_state = run_simulator_optimiser(predictor_output)
-
         transformer_state["confidence"] = predictor_output["confidence"]
 
-        # ---- AGENT 3
+        # 3. META-AGENT
         selected_policy, policies, metrics_df, policy_choices = run_meta_agent(
             df, transformer_state, mode=mode
         )
 
-        # ---- AGENT 4
+        # 4. KILL AGENT
         final_policy, decision = run_kill_agent(
             df, selected_policy, transformer_state, policies, metrics_df
         )
 
-    st.success("Done ✅")
+    st.success("Pipeline Execution Complete.")
 
     # -----------------------
-    # OUTPUT
+    # RESULTS DASHBOARD
     # -----------------------
-    st.subheader("🔮 Predictor Output")
-    st.write(predictor_output)
+    st.divider()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Predicted SoC", f"{predictor_output['soc']:.2%}")
+    col2.metric("Predicted SoH", f"{predictor_output['soh']:.2%}")
+    col3.metric("Predicted Temp", f"{predictor_output['temperature']:.1f} °C")
+    col4.metric("Model Confidence", f"{predictor_output['confidence']:.2%}")
 
-    st.subheader("🧠 Decision")
-    st.write(decision)
+    st.subheader("🛡️ Kill Agent Status")
+    status_color = "green" if decision["decision"] == "allow" else "orange" if decision["decision"] == "override" else "red"
+    st.markdown(f"**Decision:** :{status_color}[{decision['decision'].upper()}] — {decision['reason']}")
 
-    st.subheader("⚡ Final Policy")
-    st.write(final_policy)
+    # -----------------------
+    # VISUALIZATION & RUL
+    # -----------------------
+    if final_policy is not None:
+        policy_data = extract_policy(df, final_policy)
+        metrics = compute_metrics(policy_data)
+        
+        # Calculate Remaining Useful Life (RUL) 
+        # Assuming End of Life is at 80% SoH (0.80)
+        soh_loss_per_cycle = metrics["soh_loss"]
+        current_soh = predictor_output['soh']
+        end_of_life_threshold = 0.80
+        
+        if soh_loss_per_cycle > 0 and current_soh > end_of_life_threshold:
+            projected_rul_cycles = int((current_soh - end_of_life_threshold) / soh_loss_per_cycle)
+        else:
+            projected_rul_cycles = 0
+
+        st.subheader("🔋 Lifecycle & RUL Analysis")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Selected Policy ID", int(final_policy))
+        c2.metric("Cycle SoH Degradation", f"{soh_loss_per_cycle:.6f}")
+        c3.metric("Estimated RUL (Cycles)", projected_rul_cycles, help="Cycles remaining until SoH hits 80%")
+
+        st.divider()
+        st.subheader("📈 Live Charging Simulation")
+        
+        # Setup empty charts for continuous streaming
+        chart_col1, chart_col2, chart_col3 = st.columns(3)
+        
+        with chart_col1:
+            st.markdown("**State of Charge (SoC)**")
+            soc_chart = st.line_chart([policy_data['soc'][0]], height=250)
+            
+        with chart_col2:
+            st.markdown("**Temperature (K)**")
+            temp_chart = st.line_chart([policy_data['temp'][0]], height=250, color="#ffaa00")
+            
+        with chart_col3:
+            st.markdown("**Applied Current (A)**")
+            curr_chart = st.line_chart([policy_data['current'][0]], height=250, color="#ff0000")
+
+        # Simulate continuous real-time data output
+        st.caption("Simulating real-time BMS execution...")
+        for i in range(1, len(policy_data['soc'])):
+            soc_chart.add_rows([policy_data['soc'][i]])
+            temp_chart.add_rows([policy_data['temp'][i]])
+            curr_chart.add_rows([policy_data['current'][i]])
+            # Adjust sleep time to make the animation faster/slower
+            time.sleep(0.02) 
+
+    else:
+        st.error("Charging Aborted by Kill Agent. No policy to simulate.")
