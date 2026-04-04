@@ -118,10 +118,6 @@ class BatteryTransformer(nn.Module):
 
 
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
-    """
-    Builds a (seq_len, 11) feature tensor by running a mini-ECM simulation 
-    to exactly match the Transformer's training distribution.
-    """
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
         'V_RC_masked', 'V_ECM_masked', 'power', 'Temperature_measured'
@@ -131,6 +127,7 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     soh   = battery_input["soh"]
     temp  = battery_input["temp_C"]      # Celsius
     curr  = battery_input["current_A"]   # negative = discharge
+    cycle = battery_input.get("cycle_norm", 0.5)
 
     # Base ECM parameters matched to ECM.ipynb
     Q_rated = 2.3  
@@ -138,90 +135,73 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     C1 = 2000.0
     dt = 1.0
 
-    # --- AI PHYSICS FIXES ---
-    # 1. R0 Scaling: Resistance MUST increase as SoH drops so the AI sees the voltage sag
     R0 = 0.02 * (1.0 / max(soh, 0.01))
-    
-    # 2. Temperature Translation: Map the slider down to the NASA dataset's native scale
-    temp_mean_nasa = float(global_mean["Temperature_measured"]) 
-    current_temp = temp_mean_nasa + (temp - 27.0)
-
-    # Adjust Capacity for SoH
     Q_actual = Q_rated * max(soh, 0.01)
-    
-    # ECM equations define positive I for discharge 
-    I_load = -curr
+    I_load = -curr if curr < 0 else 0.0
 
     def ocv_function(s):
         s = np.clip(s, 0.0, 1.0)
         return 3.0 + 1.2*s - 0.3*np.exp(-5*s) + 0.1*np.exp(-5*(1 - s))
 
-    # Initialize States
     current_soc = soc
+    current_temp = temp
     V_RC = 0.0
     prev_volt = ocv_function(current_soc) - I_load * R0
 
     rows = []
     for t in range(seq_len):
-        
-        # 1. SOC update
         current_soc -= (I_load * dt) / (3600.0 * Q_actual)
         current_soc = np.clip(current_soc, 0.0, 1.0)
 
-        # 2. RC dynamics
         alpha = np.exp(-dt / (R1 * C1))
         V_RC = alpha * V_RC + R1 * (1 - alpha) * I_load
 
-        # 3. Voltage Calculation
         OCV = ocv_function(current_soc)
         V_ecm = OCV - I_load * R0 - V_RC
 
-        # 4. Temperature Generation
         heat_gen = (curr ** 2) * R0
         heat_loss = (current_temp - 25.0) / 2.0  
         dT = (dt / 400.0) * (heat_gen - heat_loss) 
         current_temp += dT
 
-        # 5. Final Metrics 
         dV_dt = V_ecm - prev_volt
         dT_dt = dT
         power = V_ecm * curr
         prev_volt = V_ecm
 
         row = np.array([
-            V_ecm,            # Voltage_measured
-            curr,             # Current_measured
-            dV_dt,            # dV_dt
-            dT_dt,            # dT_dt
-            V_RC,             # V_RC_masked
-            V_ecm,            # V_ECM_masked
-            power,            # power
-            current_temp,     # Temperature_measured (in NASA scale)
+            V_ecm,            
+            curr,             
+            dV_dt,            
+            dT_dt,            
+            V_RC,             
+            V_ecm,            
+            power,            
+            current_temp,     
         ])
         rows.append(row)
 
-    data = np.stack(rows)  # (seq_len, 8)
+    data = np.stack(rows) 
 
-    # Normalise the 8 numeric cols
     mean_vals = global_mean[num_cols].values
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # Extra features (not normalised)
+    # --- THE SECONDS FIX ---
     mode_flag   = 1.0 if curr < 0 else 0.0
     mode_col     = np.full((seq_len, 1), mode_flag)
 
-    # 3. Time_uniform: Match discharge progress properly
-    start_tu = np.clip(1.0 - soc, 0.0, 1.0)
-    end_tu = np.clip(start_tu + (seq_len * dt / 3600.0), 0.0, 1.0)
-    time_uniform = np.linspace(start_tu, end_tu, seq_len).reshape(-1, 1)
-
-    # 4. cycle_index: Map SoH (1.0 -> 0.70) to NASA's actual cycle count (1 -> 171)
-    estimated_cycle = int(((1.0 - soh) / 0.30) * 171)
-    estimated_cycle = np.clip(estimated_cycle, 1, 171)
-    cycle_index = np.full((seq_len, 1), estimated_cycle)
+    # 1. Calculate actual elapsed SECONDS based on missing Capacity
+    total_cycle_time = (Q_actual * 3600.0) / max(I_load, 0.1)
+    elapsed_seconds = total_cycle_time * (1.0 - soc)
     
-    # Exact feature order matching Transformer training
+    # 2. Time_uniform matches the NASA dataset (Counting actual seconds)
+    time_uniform = np.arange(elapsed_seconds, elapsed_seconds + seq_len * dt, dt).reshape(-1, 1)
+
+    # 3. Pass the exact cycle argument you provide
+    cycle_index = np.full((seq_len, 1), cycle)
+    # -----------------------
+    
     features = np.concatenate([
         data_norm[:, 0:1],   # Voltage_measured
         data_norm[:, 1:2],   # Current_measured
@@ -234,7 +214,7 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
         data_norm[:, 6:7],   # power
         cycle_index,         # cycle_index
         data_norm[:, 7:8],   # Temperature_measured
-    ], axis=1)               # (seq_len, 11)
+    ], axis=1)               
 
     return features.astype(np.float32)
 
@@ -261,27 +241,20 @@ def run_predictor(battery_input, model, global_mean, global_std, device):
     temp_mu     = float(temp_out[0, 0])
     temp_logvar = float(torch.clamp(temp_out[0, 1], -2, 2))
 
-    # confidence: higher = more certain
     soc_conf  = float(1 / (1 + np.exp(soc_logvar)))
     soh_conf  = float(1 / (1 + np.exp(soh_logvar)))
     temp_conf = float(1 / (1 + np.exp(temp_logvar)))
     avg_conf  = (soc_conf + soh_conf + temp_conf) / 3.0
 
-    # temperature is normalised — denormalise back to Celsius
     temp_mean = float(global_mean["Temperature_measured"])
     temp_std  = float(global_std["Temperature_measured"])
     temp_real = temp_mu * temp_std + temp_mean
-
-    # --- UI TRANSLATION ---
-    # Shift the AI's native NASA prediction back up to the Dashboard's 27°C scale
-    temp_real = temp_real + (27.0 - temp_mean)
 
     predictor_output = {
         "soc":        np.clip(soc_mu, 0.0, 1.0),
         "soh":        np.clip(soh_mu, 0.0, 1.0),
         "temperature": temp_real,
         "confidence": avg_conf,
-        # per-target confidences
         "soc_conf":   soc_conf,
         "soh_conf":   soh_conf,
         "temp_conf":  temp_conf,
@@ -349,29 +322,25 @@ def simulate_charging(profile, state, params, log_trajectory=False):
     soc, soh, temp = state["soc"], state["soh"], state["temp"]
     dt = params["dt"]
     soc_t, temp_t, soh_t = [], [], []
-    actual_profile = [] # Track the clipped current
+    actual_profile = [] 
 
     for current in profile:
-        # --- SMART CHARGER FIX (CC-CV Emulation) ---
-        # Check if current would push voltage over V_max
         ocv = ocv_function(soc)
         R0 = params["R0_nominal"] * (1.0 / max(soh, 0.01))
         
         if ocv + abs(current) * R0 > params["V_max"]:
-            # Clip current so it gracefully holds at V_max instead of crashing
             current = max(0.0, (params["V_max"] - ocv) / R0)
-        # -------------------------------------------
 
         soc, voltage, R0 = ecm_step(soc, soh, current, dt, params)
         temp = thermal_step(temp, current, R0, params, dt)
         soh  = degradation_step(soh, current, temp, dt)
         
         if temp > params["T_max"]:
-            return None # Still abort if it overheats
+            return None 
 
         if log_trajectory:
             soc_t.append(soc); temp_t.append(temp); soh_t.append(soh)
-            actual_profile.append(current) # Save the real applied current
+            actual_profile.append(current) 
 
     charging_time = len(profile) * dt
     soh_loss      = state["soh"] - soh
@@ -459,14 +428,13 @@ def build_synthetic_dataset(pareto_profiles, state):
         if res is None:
             continue
             
-        # Unpack the new actual_profile from the Smart Charger fix
         _, _, soc_t, temp_t, soh_t, actual_profile = res
         
         for t in range(len(actual_profile)):
             rows.append({
                 "solution_id":   sol_id,
                 "time_s":        t,
-                "current_A":     actual_profile[t], # Use the safe, clipped current
+                "current_A":     actual_profile[t], 
                 "SoC":           soc_t[t],
                 "temperature_K": temp_t[t],
                 "SoH":           soh_t[t],
@@ -486,7 +454,6 @@ def run_simulator_optimiser(predictor_output):
     section("NSGA-II multi-objective optimisation")
     print("  Running NSGA-II (40 generations, 60 individuals)...")
     
-    # Run the optimizer to generate the dataset dynamically
     pareto_profiles, pareto_F = run_nsga2(transformer_state)
     
     section("Building synthetic dataset")
@@ -662,12 +629,10 @@ def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df)
 
     decision, checks = kill_agent(metrics, battery_state)
 
-    # resolve final policy
     if decision["decision"] == "allow":
         final_policy = selected_policy
         print(f"\n  Final policy : {int(final_policy)} — APPROVED")
     elif decision["decision"] == "override":
-        # Find safest approved policy
         safe_candidates = []
         for pid in df["solution_id"].unique():
             pol  = extract_policy(df, pid)
@@ -763,7 +728,6 @@ def main():
     print(f"  Mode: {args.mode.upper()}")
     print(SEP)
 
-    # ── load model and globals ────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n  Device: {device}")
 
@@ -777,12 +741,10 @@ def main():
     global_mean = globs["global_mean"]
     global_std  = globs["global_std"]
 
-    # ── run pipeline ──────────────────────────────────────────────────────────
     predictor_output = run_predictor(battery_input, model, global_mean, global_std, device)
 
     df, transformer_state = run_simulator_optimiser(predictor_output)
 
-    # attach confidence to transformer_state for downstream agents
     transformer_state["confidence"] = predictor_output["confidence"]
 
     selected_policy, policies, metrics_df, policy_choices = run_meta_agent(
