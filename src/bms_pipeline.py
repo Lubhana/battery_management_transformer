@@ -1,29 +1,42 @@
 """
-BMS Master Pipeline  (FIXED)
-=============================
-Fixes applied vs original:
-  1. OCV coefficients  — replaced placeholder `3.0 + 1.2*soc` with the
-                         fitted 5th-degree polynomial from the ECM notebook.
-                         If you refitted on your own data, replace the
-                         COEFFS tuple below with your printed coefficients.
-  2. Current sign      — training data used positive current for discharge;
-                         pipeline now converts the (negative) input current
-                         to positive before building the feature sequence.
-  3. Voltage feature   — uses the fitted ocv_function(soc) everywhere
-                         instead of the placeholder linear approximation.
-  4. Battery capacity  — unified to 2.3 Ah (matching ECM notebook Q_rated).
-  5. V_RC / V_ECM     — computed from a running ECM step at inference time
-                         so the features are not dead zeros.
+BMS Master Pipeline  (v2 — Inference-Level Robustness Fixes)
+=============================================================
+Changes vs original FIXED pipeline:
+  FIX A — OOD Detection
+           Detects impossible (soc, soh) combinations the model
+           never saw during discharge-only training and bypasses
+           the transformer entirely, using raw inputs + low
+           confidence so the kill agent stays cautious.
+
+  FIX B — Post-prediction Blending
+           When the model's prediction deviates strongly from the
+           input, pulls the output back toward the input using a
+           dynamically computed alpha.  Alpha shrinks further when
+           SoH is low (known weak region of the model).
+
+  FIX C — Heuristic Confidence Override
+           Replaces the flat ~88 % transformer confidence (caused
+           by undertrained logvar heads) with a heuristic that
+           actually varies with input extremity and prediction
+           deviation.  This makes the kill agent's confidence
+           gate meaningful.
+
+  FIX D — Adaptive Kill-Agent Thresholds
+           Kill agent tightens soh_loss and health limits when the
+           input SoH is already low, compensating for model
+           unreliability in that region.
+
+All original fixes (OCV polynomial, current sign, ECM spin-up,
+2.3 Ah capacity) are retained.
 
 Usage:
-  python bms_pipeline.py                        # uses default input
-  python bms_pipeline.py --soc 0.45             # override any input field
-  python bms_pipeline.py --soc 0.3 --mode fast  # manual charging mode
+  python bms_pipeline_fixed.py
+  python bms_pipeline_fixed.py --soc 0.45 --soh 0.95
+  python bms_pipeline_fixed.py --soc 1.0  --soh 0.0   # OOD → bypass
+  python bms_pipeline_fixed.py --soc 0.3  --mode fast
 """
 
 import os
-import re
-import sys
 import math
 import pickle
 import argparse
@@ -31,8 +44,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -43,7 +54,6 @@ warnings.filterwarnings("ignore")
 MODEL_PATH   = 'models/best_model.pt'
 GLOBALS_PATH = 'models/predictor_globals.pkl'
 DATASET_PATH = 'dataset/nsga2_synthetic_dataset.csv'
-DATA_DIR     = 'dataset/ECM_processed_cycles'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -52,21 +62,14 @@ SEP  = "=" * 60
 SEP2 = "-" * 60
 
 def banner(title):
-    print(f"\n{SEP}")
-    print(f"  {title}")
-    print(SEP)
+    print(f"\n{SEP}\n  {title}\n{SEP}")
 
 def section(title):
-    print(f"\n{SEP2}")
-    print(f"  {title}")
-    print(SEP2)
+    print(f"\n{SEP2}\n  {title}\n{SEP2}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 1 — OCV FUNCTION
-# These are the coefficients produced by `np.polyfit(soc_bin_centers,
-# voltage_bin_means, deg=5)` in ECM.ipynb Cell 12.
-# !! If you ran polyfit on YOUR dataset, replace these 6 numbers !!
+# OCV POLYNOMIAL  (5th-degree, fitted from NASA discharge data)
 # ─────────────────────────────────────────────────────────────────────────────
 OCV_COEFFS = (
     25.75752864, -85.18817968, 111.18268373,
@@ -74,59 +77,38 @@ OCV_COEFFS = (
 )
 
 def ocv_function(soc):
-    """
-    5th-degree polynomial OCV fitted from NASA discharge data.
-    Clamp SoC to the valid fitting range used in the notebook (0.15–0.95).
-    """
     s = np.clip(soc, 0.15, 0.95)
     c0, c1, c2, c3, c4, c5 = OCV_COEFFS
-    return (
-        c0 * s**5 +
-        c1 * s**4 +
-        c2 * s**3 +
-        c3 * s**2 +
-        c4 * s +
-        c5
-    )
+    return (c0*s**5 + c1*s**4 + c2*s**3 + c3*s**2 + c4*s + c5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 5 — ECM CLASS (used for V_RC / V_ECM feature generation at inference)
-# Mirrors the BatteryECM from ECM.ipynb exactly.
+# BATTERY ECM
 # ─────────────────────────────────────────────────────────────────────────────
 class BatteryECM:
-    """
-    Single-RC equivalent-circuit model.
-    Convention: I > 0 → discharge  (same as training data in notebook).
-    """
+    """Single-RC ECM.  I > 0 → discharge (training convention)."""
     def __init__(self, Q_Ah, R0, R1, C1, dt, soc_init=1.0):
-        self.Q   = Q_Ah          # capacity in Ah
-        self.R0  = R0
-        self.R1  = R1
-        self.C1  = C1
-        self.dt  = dt
-        self.SOC = soc_init
+        self.Q    = Q_Ah
+        self.R0   = R0
+        self.R1   = R1
+        self.C1   = C1
+        self.dt   = dt
+        self.SOC  = soc_init
         self.V_RC = 0.0
 
     def step(self, I):
-        """Returns (SOC, V_RC, OCV, V_ECM)."""
-        # SOC integration (discharge positive)
         self.SOC -= (I * self.dt) / (3600.0 * self.Q)
         self.SOC  = np.clip(self.SOC, 0.0, 1.0)
-
-        # RC dynamics
         alpha     = np.exp(-self.dt / (self.R1 * self.C1))
         self.V_RC = alpha * self.V_RC + self.R1 * (1 - alpha) * I
-
-        OCV   = ocv_function(self.SOC)
-        V_ecm = OCV - I * self.R0 - self.V_RC
+        OCV       = ocv_function(self.SOC)
+        V_ecm     = OCV - I * self.R0 - self.V_RC
         return self.SOC, self.V_RC, OCV, V_ecm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AGENT 1 — PREDICTOR
+# TRANSFORMER MODEL
 # ─────────────────────────────────────────────────────────────────────────────
-
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=500):
         super().__init__()
@@ -137,33 +119,28 @@ class PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer("pe", pe)
+        self.register_buffer("pe", pe.unsqueeze(0))
 
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
 
 class BatteryTransformer(nn.Module):
-    def __init__(self, input_dim=11, d_model=128, nhead=4, num_layers=2, dropout=0.2):
+    def __init__(self, input_dim=11, d_model=128, nhead=4,
+                 num_layers=2, dropout=0.2):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, d_model)
+        self.input_proj  = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
-            dim_feedforward=256, dropout=dropout,
-            batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            dim_feedforward=256, dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        decoder_layer = nn.TransformerDecoderLayer(
+        dec_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead,
-            dim_feedforward=256, dropout=dropout,
-            batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-
+            dim_feedforward=256, dropout=dropout, batch_first=True)
+        self.decoder     = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
         self.query_embed = nn.Parameter(torch.randn(1, 3, d_model))
 
         self.soc_mu_head      = nn.Linear(d_model, 1)
@@ -173,101 +150,202 @@ class BatteryTransformer(nn.Module):
         self.temp_mu_head     = nn.Linear(d_model, 1)
         self.temp_logvar_head = nn.Linear(d_model, 1)
 
-        for head in [self.soc_logvar_head, self.soh_logvar_head, self.temp_logvar_head]:
+        for head in [self.soc_logvar_head, self.soh_logvar_head,
+                     self.temp_logvar_head]:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
 
     def forward(self, x):
-        batch_size = x.size(0)
-        x       = self.input_proj(x)
-        x       = self.pos_encoder(x)
+        B       = x.size(0)
+        x       = self.pos_encoder(self.input_proj(x))
         memory  = self.encoder(x)
-        queries = self.query_embed.expand(batch_size, -1, -1)
+        queries = self.query_embed.expand(B, -1, -1)
         decoded = self.decoder(queries, memory)
 
-        soc_feat  = decoded[:, 0, :]
-        soh_feat  = decoded[:, 1, :]
-        temp_feat = decoded[:, 2, :]
+        soc_f, soh_f, tmp_f = decoded[:, 0], decoded[:, 1], decoded[:, 2]
 
-        soc_mu      = self.soc_mu_head(soc_feat)
-        soc_logvar  = self.soc_logvar_head(soc_feat.detach())
-        soh_mu      = self.soh_mu_head(soh_feat)
-        soh_logvar  = self.soh_logvar_head(soh_feat.detach())
-        temp_mu     = self.temp_mu_head(temp_feat)
-        temp_logvar = self.temp_logvar_head(temp_feat.detach())
-
-        soc  = torch.cat([soc_mu,  soc_logvar],  dim=1)
-        soh  = torch.cat([soh_mu,  soh_logvar],  dim=1)
-        temp = torch.cat([temp_mu, temp_logvar], dim=1)
+        soc  = torch.cat([self.soc_mu_head(soc_f),
+                          self.soc_logvar_head(soc_f.detach())],  dim=1)
+        soh  = torch.cat([self.soh_mu_head(soh_f),
+                          self.soh_logvar_head(soh_f.detach())],  dim=1)
+        temp = torch.cat([self.temp_mu_head(tmp_f),
+                          self.temp_logvar_head(tmp_f.detach())], dim=1)
         return soc, soh, temp
 
 
-def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX A — OOD DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+def is_ood(soc: float, soh: float):
     """
-    Builds a (seq_len, 11) feature tensor that matches the training
-    distribution from ECM.ipynb.
+    Flags (soc, soh) combinations the discharge-only model never saw.
 
-    Key fixes vs original:
-      - current is made positive (discharge convention from training)
-      - Voltage_measured uses the fitted OCV, not the placeholder linear
-      - V_RC and V_ECM are computed from a running ECM step (not zeros)
+    Training logic:
+      - High SoC appears at the START of a cycle  → battery is relatively healthy
+      - Low SoC appears at the END of a cycle     → battery is more degraded
+    Therefore the model implicitly learned:
+      high SoC co-occurs with high SoH  and
+      low  SoC co-occurs with low  SoH
+    The two clearly OOD regions are the anti-diagonal extremes.
     """
+    reasons = []
+
+    # Dead battery being asked to charge at full SoC — never in training
+    if soh < 0.3 and soc > 0.7:
+        reasons.append(
+            f"high SoC ({soc:.2f}) with very low SoH ({soh:.2f}) — "
+            "model never saw a near-dead battery at high charge"
+        )
+
+    # Fully discharged healthy battery — rare edge in discharge-only data
+    if soc < 0.05 and soh > 0.98:
+        reasons.append(
+            f"near-zero SoC ({soc:.2f}) with near-perfect SoH ({soh:.2f}) — "
+            "model rarely saw this in discharge cycles"
+        )
+
+    # Any SoH below 0.2 — too few samples in NASA dataset
+    if soh < 0.2:
+        reasons.append(
+            f"SoH ({soh:.2f}) below 0.20 — severely under-represented "
+            "in discharge training data"
+        )
+
+    return len(reasons) > 0, reasons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX B — POST-PREDICTION BLENDING
+# ─────────────────────────────────────────────────────────────────────────────
+def blend_prediction(raw_input: dict, model_output: dict,
+                     base_alpha: float = 0.4) -> dict:
+    """
+    Credibility-weighted blend between model output and raw input.
+
+    alpha=1 → trust model fully
+    alpha=0 → trust raw input fully
+
+    Alpha is reduced when:
+      - SoC deviation is large  (model is overconfident)
+      - SoH input is low        (model is poorly calibrated here)
+      - SoH deviation is large
+    """
+    soc_dev = abs(model_output["soc"] - raw_input["soc"])
+    soh_dev = abs(model_output["soh"] - raw_input["soh"])
+
+    alpha = base_alpha
+
+    # Large SoC swing → distrust model
+    if soc_dev > 0.3:
+        alpha *= 0.5
+        print(f"  [Blend] Large SoC deviation ({soc_dev:.3f}) → "
+              f"alpha reduced to {alpha:.3f}")
+
+    # Low SoH regime → model poorly calibrated
+    if raw_input["soh"] < 0.5:
+        alpha *= 0.5
+        print(f"  [Blend] Low input SoH ({raw_input['soh']:.2f}) → "
+              f"alpha reduced to {alpha:.3f}")
+
+    # Large SoH swing → distrust model
+    if soh_dev > 0.3:
+        alpha *= 0.7
+        print(f"  [Blend] Large SoH deviation ({soh_dev:.3f}) → "
+              f"alpha reduced to {alpha:.3f}")
+
+    blended_soc = alpha * model_output["soc"] + (1 - alpha) * raw_input["soc"]
+    blended_soh = alpha * model_output["soh"] + (1 - alpha) * raw_input["soh"]
+
+    # Penalise confidence proportional to how much correction was needed
+    correction   = (soc_dev + soh_dev) / 2.0
+    adj_conf     = max(0.2, model_output["confidence"] - correction)
+
+    print(f"  [Blend] alpha={alpha:.3f} | "
+          f"SoC {model_output['soc']:.4f}→{blended_soc:.4f} | "
+          f"SoH {model_output['soh']:.4f}→{blended_soh:.4f} | "
+          f"conf {model_output['confidence']:.3f}→{adj_conf:.3f}")
+
+    model_output["soc"]        = float(np.clip(blended_soc, 0.0, 1.0))
+    model_output["soh"]        = float(np.clip(blended_soh, 0.0, 1.0))
+    model_output["confidence"] = adj_conf
+    return model_output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX C — HEURISTIC CONFIDENCE
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_heuristic_confidence(battery_input: dict,
+                                 model_output: dict) -> float:
+    """
+    Replaces the flat transformer confidence (~88% regardless of input)
+    with a heuristic that varies with:
+      - How much the model deviates from the input
+      - How extreme the input SoH / SoC values are
+        (edges of the training distribution → less reliable)
+    """
+    soc_dev = abs(model_output["soc"] - battery_input["soc"])
+    soh_dev = abs(model_output["soh"] - battery_input["soh"])
+
+    deviation_penalty = min(0.5, (soc_dev + soh_dev) / 2.0)
+
+    soh_edge_penalty = 0.0
+    if battery_input["soh"] < 0.3:
+        soh_edge_penalty = 0.30
+    elif battery_input["soh"] < 0.5:
+        soh_edge_penalty = 0.15
+    elif battery_input["soh"] > 0.98:
+        soh_edge_penalty = 0.05
+
+    soc_edge_penalty = 0.0
+    if battery_input["soc"] < 0.05 or battery_input["soc"] > 0.98:
+        soc_edge_penalty = 0.10
+    elif battery_input["soc"] < 0.10 or battery_input["soc"] > 0.95:
+        soc_edge_penalty = 0.05
+
+    confidence = 1.0 - deviation_penalty - soh_edge_penalty - soc_edge_penalty
+    return float(np.clip(confidence, 0.15, 0.95))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUT SEQUENCE BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
         'V_RC_masked', 'V_ECM_masked', 'power', 'Temperature_measured'
     ]
 
     soc  = battery_input["soc"]
-    temp = battery_input["temp_C"]          # Celsius
+    temp = battery_input["temp_C"]
+    curr = abs(battery_input["current_A"])   # positive = discharge (training)
 
-    # ── FIX 2: make discharge current positive to match training convention ──
-    curr = abs(battery_input["current_A"])  # training used -cycle['Current_measured']
-
-    # ── FIX 5: spin up an ECM to get realistic V_RC / V_ECM per time-step ───
-    ecm = BatteryECM(
-        Q_Ah=2.3,       # FIX 4: 2.3 Ah matches ECM notebook
-        R0=0.02,
-        R1=0.01,
-        C1=2000.0,
-        dt=1.0,
-        soc_init=soc,
-    )
-
+    ecm = BatteryECM(Q_Ah=2.3, R0=0.02, R1=0.01, C1=2000.0,
+                     dt=1.0, soc_init=soc)
     rows = []
-    for t in range(seq_len):
+    for _ in range(seq_len):
         noise = np.random.normal(0, 0.001, 8)
-
-        # ── FIX 1 & 3: use fitted OCV, not 3.0 + 1.2*soc ───────────────────
         ecm_soc, V_RC, OCV, V_ECM = ecm.step(curr)
         volt = OCV + noise[0]
+        rows.append(np.array([
+            volt,
+            curr  + noise[1],
+            noise[2],
+            noise[3],
+            V_RC  + noise[4],
+            V_ECM + noise[5],
+            volt * curr + noise[6],
+            temp  + noise[7],
+        ]))
 
-        row = np.array([
-            volt,                       # Voltage_measured
-            curr  + noise[1],           # Current_measured  (positive = discharge)
-            noise[2],                   # dV_dt
-            noise[3],                   # dT_dt
-            V_RC  + noise[4],           # V_RC_masked   (FIX 5: not zero)
-            V_ECM + noise[5],           # V_ECM_masked  (FIX 5: not zero)
-            volt * curr + noise[6],     # power
-            temp  + noise[7],           # Temperature_measured
-        ])
-        rows.append(row)
-
-    data = np.stack(rows)  # (seq_len, 8)
-
+    data      = np.stack(rows)
     mean_vals = global_mean[num_cols].values
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # extra features (not normalised)
-    mode_flag    = 1.0          # discharge mode (curr > 0 in training)
     time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
     cycle_index  = np.full((seq_len, 1), battery_input.get("cycle_norm", 0.5))
-    mode_col     = np.full((seq_len, 1), mode_flag)
+    mode_col     = np.ones((seq_len, 1))   # 1.0 = discharge mode
 
-    # feature order must match BatteryDataset exactly:
-    # Voltage, Current, Time_uniform, dV_dt, dT_dt,
-    # mode_flag, V_RC_masked, V_ECM_masked, power, cycle_index, Temperature
     features = np.concatenate([
         data_norm[:, 0:1],   # Voltage_measured
         data_norm[:, 1:2],   # Current_measured
@@ -280,20 +358,45 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
         data_norm[:, 6:7],   # power
         cycle_index,         # cycle_index
         data_norm[:, 7:8],   # Temperature_measured
-    ], axis=1)               # (seq_len, 11)
+    ], axis=1)
 
     return features.astype(np.float32)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT 1 — PREDICTOR  (with Fixes A, B, C)
+# ─────────────────────────────────────────────────────────────────────────────
 def run_predictor(battery_input, model, global_mean, global_std, device):
     banner("AGENT 1 — PREDICTOR")
     print(f"  Input battery state:")
-    print(f"    SoC (initial)  : {battery_input['soc']:.3f}")
-    print(f"    SoH (initial)  : {battery_input['soh']:.3f}")
+    print(f"    SoC            : {battery_input['soc']:.3f}")
+    print(f"    SoH            : {battery_input['soh']:.3f}")
     print(f"    Temperature    : {battery_input['temp_C']:.1f} °C")
-    print(f"    Current (raw)  : {battery_input['current_A']:.2f} A  "
-          f"(discharge={battery_input['current_A'] < 0})")
+    print(f"    Current (raw)  : {battery_input['current_A']:.2f} A")
 
+    # ── FIX A: OOD check ─────────────────────────────────────────────────────
+    ood, ood_reasons = is_ood(battery_input["soc"], battery_input["soh"])
+    if ood:
+        section("OOD Detection — BYPASS")
+        for r in ood_reasons:
+            print(f"  ⚠  {r}")
+        print(f"\n  Model bypassed — using raw inputs as state estimate.")
+        print(f"  Confidence forced to 0.25 (kill agent will be cautious).")
+
+        raw_conf = 0.25
+        return {
+            "soc":         float(battery_input["soc"]),
+            "soh":         float(battery_input["soh"]),
+            "temperature": float(battery_input["temp_C"]),
+            "confidence":  raw_conf,
+            "soc_conf":    raw_conf,
+            "soh_conf":    raw_conf,
+            "temp_conf":   raw_conf,
+            "ood":         True,
+            "ood_reasons": ood_reasons,
+        }
+
+    # ── Normal transformer inference ─────────────────────────────────────────
     seq = build_input_sequence(battery_input, global_mean, global_std)
     x   = torch.tensor(seq).unsqueeze(0).to(device)
 
@@ -302,51 +405,69 @@ def run_predictor(battery_input, model, global_mean, global_std, device):
         soc_out, soh_out, temp_out = model(x)
 
     soc_mu      = float(soc_out[0, 0])
-    soc_logvar  = float(torch.clamp(soc_out[0, 1], -2, 2))
+    soc_logvar  = float(torch.clamp(soc_out[0, 1],  -2, 2))
     soh_mu      = float(soh_out[0, 0])
-    soh_logvar  = float(torch.clamp(soh_out[0, 1], -2, 2))
+    soh_logvar  = float(torch.clamp(soh_out[0, 1],  -2, 2))
     temp_mu     = float(temp_out[0, 0])
     temp_logvar = float(torch.clamp(temp_out[0, 1], -2, 2))
 
-    soc_conf  = float(1 / (1 + np.exp(soc_logvar)))
-    soh_conf  = float(1 / (1 + np.exp(soh_logvar)))
-    temp_conf = float(1 / (1 + np.exp(temp_logvar)))
-    avg_conf  = (soc_conf + soh_conf + temp_conf) / 3.0
+    # Raw transformer confidence (likely flat — will be overridden below)
+    soc_conf_raw  = float(1 / (1 + np.exp(soc_logvar)))
+    soh_conf_raw  = float(1 / (1 + np.exp(soh_logvar)))
+    temp_conf_raw = float(1 / (1 + np.exp(temp_logvar)))
+    avg_conf_raw  = (soc_conf_raw + soh_conf_raw + temp_conf_raw) / 3.0
 
     temp_mean = float(global_mean["Temperature_measured"])
     temp_std  = float(global_std["Temperature_measured"])
     temp_real = temp_mu * temp_std + temp_mean
 
     predictor_output = {
-        "soc":         np.clip(soc_mu, 0.0, 1.0),
-        "soh":         np.clip(soh_mu, 0.0, 1.0),
+        "soc":         float(np.clip(soc_mu, 0.0, 1.0)),
+        "soh":         float(np.clip(soh_mu, 0.0, 1.0)),
         "temperature": temp_real,
-        "confidence":  avg_conf,
-        "soc_conf":    soc_conf,
-        "soh_conf":    soh_conf,
-        "temp_conf":   temp_conf,
+        "confidence":  avg_conf_raw,
+        "soc_conf":    soc_conf_raw,
+        "soh_conf":    soh_conf_raw,
+        "temp_conf":   temp_conf_raw,
+        "ood":         False,
+        "ood_reasons": [],
     }
 
-    section("Predictor Output")
-    print(f"  SoC prediction   : {predictor_output['soc']:.4f}  (confidence {soc_conf:.3f})")
-    print(f"  SoH prediction   : {predictor_output['soh']:.4f}  (confidence {soh_conf:.3f})")
-    print(f"  Temp prediction  : {predictor_output['temperature']:.2f} °C  (confidence {temp_conf:.3f})")
-    print(f"  Overall confidence: {avg_conf:.3f}  "
-          f"{'[HIGH UNCERTAINTY — pipeline will be cautious]' if avg_conf < 0.5 else '[OK]'}")
+    section("Raw Transformer Output")
+    print(f"  SoC : {predictor_output['soc']:.4f}  (conf {soc_conf_raw:.3f})")
+    print(f"  SoH : {predictor_output['soh']:.4f}  (conf {soh_conf_raw:.3f})")
+    print(f"  Temp: {predictor_output['temperature']:.2f} °C  (conf {temp_conf_raw:.3f})")
+    print(f"  Avg conf (raw): {avg_conf_raw:.3f}  ← likely flat, will be overridden")
+
+    # ── FIX B: blend prediction with raw input ────────────────────────────────
+    section("FIX B — Post-prediction Blending")
+    predictor_output = blend_prediction(battery_input, predictor_output)
+
+    # ── FIX C: override with heuristic confidence ────────────────────────────
+    section("FIX C — Heuristic Confidence Override")
+    heuristic_conf = compute_heuristic_confidence(battery_input, predictor_output)
+    print(f"  Raw transformer conf : {avg_conf_raw:.3f}")
+    print(f"  Heuristic conf       : {heuristic_conf:.3f}")
+    predictor_output["confidence"] = heuristic_conf
+
+    section("Final Predictor Output")
+    print(f"  SoC  : {predictor_output['soc']:.4f}")
+    print(f"  SoH  : {predictor_output['soh']:.4f}")
+    print(f"  Temp : {predictor_output['temperature']:.2f} °C")
+    print(f"  Conf : {predictor_output['confidence']:.3f}  "
+          f"{'[LOW — pipeline will be cautious]' if predictor_output['confidence'] < 0.5 else '[OK]'}")
 
     return predictor_output
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 2 — SIMULATOR + OPTIMISER
-# FIX 4: capacity_Ah unified to 2.3 to match ECM notebook
 # ─────────────────────────────────────────────────────────────────────────────
-
 BATTERY_PARAMS = {
-    "capacity_Ah": 2.3,     # FIX 4: was 2.0 — must match ECM notebook Q_rated
-    "R0_nominal":  0.02,    # FIX 4: was 0.05 — match ECM notebook R0_init
-    "R1":          0.01,    # added to match ECM
-    "C1":          2000.0,  # added to match ECM
+    "capacity_Ah": 2.3,
+    "R0_nominal":  0.02,
+    "R1":          0.01,
+    "C1":          2000.0,
     "V_max":       4.2,
     "V_min":       3.0,
     "T_amb":       298.0,
@@ -367,16 +488,9 @@ MUT_STD       = 0.3
 
 
 def ecm_step(soc, soh, current, dt, params):
-    """
-    FIX 1+2: uses the fitted ocv_function; current is positive=charge
-    in the simulator (charging context), matching the sign convention
-    expected here (charging profile uses positive I).
-    """
     Q        = params["capacity_Ah"] * soh * 3600.0
-    # charging: SoC increases
     soc_next = np.clip(soc + (abs(current) * dt) / Q, 0.0, 1.0)
     R0       = params["R0_nominal"] * (1.0 / max(soh, 0.01))
-    # FIX 1: use fitted OCV
     voltage  = ocv_function(soc) + abs(current) * R0
     return soc_next, voltage, R0
 
@@ -423,7 +537,8 @@ def fitness_function(sim_result, state):
 
 
 def run_ga(state):
-    population = [np.random.uniform(I_MIN, I_MAX, N_GENES) for _ in range(POP_SIZE)]
+    population = [np.random.uniform(I_MIN, I_MAX, N_GENES)
+                  for _ in range(POP_SIZE)]
 
     for gen in range(N_GENERATIONS):
         fitnesses = np.array([
@@ -443,7 +558,8 @@ def run_ga(state):
             next_pop.append(child)
         population = next_pop
         if (gen + 1) % 5 == 0 or gen == 0:
-            print(f"    GA gen {gen+1:2d}/{N_GENERATIONS} | best fitness {max(fitnesses):.2f}")
+            print(f"    GA gen {gen+1:2d}/{N_GENERATIONS} | "
+                  f"best fitness {max(fitnesses):.2f}")
 
     fitnesses = np.array([
         fitness_function(simulate_charging(ind, state, BATTERY_PARAMS), state)
@@ -473,7 +589,8 @@ def run_nsga2(state):
                     F.append([1e3, 1e3, 1e3])
                 else:
                     _, peak_temp, soh_loss, final_soc = sim
-                    F.append([-(final_soc - state["soc"]), peak_temp, soh_loss])
+                    F.append([-(final_soc - state["soc"]),
+                              peak_temp, soh_loss])
             out["F"] = np.array(F)
 
     result = minimize(
@@ -489,7 +606,8 @@ def run_nsga2(state):
 def build_synthetic_dataset(pareto_profiles, state):
     rows = []
     for sol_id, profile in enumerate(pareto_profiles):
-        res = simulate_charging(profile, state, BATTERY_PARAMS, log_trajectory=True)
+        res = simulate_charging(profile, state, BATTERY_PARAMS,
+                                log_trajectory=True)
         if res is None:
             continue
         _, _, soc_t, temp_t, soh_t = res
@@ -511,26 +629,28 @@ def run_simulator_optimiser(predictor_output):
     transformer_state = {
         "soc":        predictor_output["soc"],
         "soh":        predictor_output["soh"],
-        "temp":       predictor_output["temperature"] + 273.15,  # °C → K
+        "temp":       predictor_output["temperature"] + 273.15,
         "confidence": predictor_output["confidence"],
     }
 
     section("Simulator — ECM physics check")
     test_profile = np.full(60, 1.5)
-    test_result  = simulate_charging(test_profile, transformer_state, BATTERY_PARAMS)
+    test_result  = simulate_charging(test_profile, transformer_state,
+                                     BATTERY_PARAMS)
     if test_result:
         _, peak_t, soh_loss, final_soc = test_result
         print(f"  1-min test sim at 1.5 A:")
-        print(f"    Final SoC  : {final_soc:.4f}")
-        print(f"    Peak temp  : {peak_t:.2f} K")
-        print(f"    SoH loss   : {soh_loss:.6f}")
+        print(f"    Final SoC : {final_soc:.4f}")
+        print(f"    Peak temp : {peak_t:.2f} K")
+        print(f"    SoH loss  : {soh_loss:.6f}")
     else:
         print("  Test simulation hit safety limit — battery state extreme")
 
     if os.path.exists(DATASET_PATH):
         section("Loading existing nsga2_synthetic_dataset.csv")
         df = pd.read_csv(DATASET_PATH)
-        print(f"  Loaded {len(df):,} rows | {df['solution_id'].nunique()} solutions")
+        print(f"  Loaded {len(df):,} rows | "
+              f"{df['solution_id'].nunique()} solutions")
     else:
         section("GA optimisation")
         best_ga = run_ga(transformer_state)
@@ -546,9 +666,12 @@ def run_simulator_optimiser(predictor_output):
         peak_temps =  pareto_F[:, 1]
         soh_losses =  pareto_F[:, 2]
         print(f"  Pareto front: {len(pareto_profiles)} solutions")
-        print(f"    SoC gain range  : {soc_gains.min():.4f} — {soc_gains.max():.4f}")
-        print(f"    Peak temp range : {peak_temps.min():.2f} — {peak_temps.max():.2f} K")
-        print(f"    SoH loss range  : {soh_losses.min():.6f} — {soh_losses.max():.6f}")
+        print(f"    SoC gain range  : {soc_gains.min():.4f} — "
+              f"{soc_gains.max():.4f}")
+        print(f"    Peak temp range : {peak_temps.min():.2f} — "
+              f"{peak_temps.max():.2f} K")
+        print(f"    SoH loss range  : {soh_losses.min():.6f} — "
+              f"{soh_losses.max():.6f}")
 
         section("Building synthetic dataset")
         df = build_synthetic_dataset(pareto_profiles, transformer_state)
@@ -561,7 +684,6 @@ def run_simulator_optimiser(predictor_output):
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 3 — META-AGENT
 # ─────────────────────────────────────────────────────────────────────────────
-
 def extract_policies(df):
     policies = {}
     for sid, grp in df.groupby("solution_id"):
@@ -589,7 +711,8 @@ def compute_policy_metrics(policies):
 def identify_representative_policies(metrics_df):
     fast_idx     = metrics_df["soc_gain"].idxmax()
     gentle_idx   = metrics_df["soh_loss"].idxmin()
-    balanced_idx = (metrics_df["soc_gain"] - metrics_df["soc_gain"].median()).abs().idxmin()
+    balanced_idx = (metrics_df["soc_gain"] -
+                    metrics_df["soc_gain"].median()).abs().idxmin()
     return {
         "fast":     metrics_df.loc[fast_idx,     "solution_id"],
         "balanced": metrics_df.loc[balanced_idx, "solution_id"],
@@ -602,24 +725,26 @@ def meta_agent_select(policy_choices, transformer_state, mode="auto"):
     soh        = transformer_state["soh"]
     confidence = transformer_state.get("confidence", 1.0)
 
+    # Low confidence → always gentle (FIX C makes this gate meaningful now)
     if confidence < 0.5:
-        return policy_choices["gentle"], "predictor confidence low — defaulting to gentle"
+        return (policy_choices["gentle"],
+                f"predictor confidence low ({confidence:.3f}) — gentle")
 
     if mode == "fast":
-        return policy_choices["fast"],     "manual mode: fast"
+        return policy_choices["fast"],         "manual mode: fast"
     if mode == "balanced":
-        return policy_choices["balanced"], "manual mode: balanced"
+        return policy_choices["balanced"],     "manual mode: balanced"
     if mode == "battery_care":
-        return policy_choices["gentle"],   "manual mode: battery_care"
+        return policy_choices["gentle"],       "manual mode: battery_care"
 
     if soh < 0.9:
-        return policy_choices["gentle"],   f"SoH={soh:.2f} below 0.90 — gentle"
+        return policy_choices["gentle"],       f"SoH={soh:.2f} below 0.90 — gentle"
     if soc < 0.4 and soh >= 0.9:
-        return policy_choices["fast"],     f"low SoC={soc:.2f} and healthy — fast"
+        return policy_choices["fast"],         f"low SoC={soc:.2f} and healthy — fast"
     if soc < 0.4 and soh < 0.9:
-        return policy_choices["balanced"], f"low SoC={soc:.2f} but degraded — balanced"
+        return policy_choices["balanced"],     f"low SoC={soc:.2f} but degraded — balanced"
 
-    return policy_choices["balanced"], "default: balanced"
+    return policy_choices["balanced"],         "default: balanced"
 
 
 def run_meta_agent(df, transformer_state, mode="auto"):
@@ -656,9 +781,8 @@ def run_meta_agent(df, transformer_state, mode="auto"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AGENT 4 — KILL AGENT
+# AGENT 4 — KILL AGENT  (with FIX D — adaptive thresholds)
 # ─────────────────────────────────────────────────────────────────────────────
-
 def extract_policy(df, policy_id):
     data = df[df["solution_id"] == policy_id]
     return {
@@ -692,15 +816,20 @@ def kill_agent(policy_metrics, battery_state,
                         "breached": breached})
         return breached
 
-    if chk("Peak temperature",   policy_metrics["peak_temp"],          peak_temp_limit):
+    if chk("Peak temperature",   policy_metrics["peak_temp"],
+           peak_temp_limit):
         return {"decision": "abort",    "reason": "temperature limit exceeded"}, checks
-    if chk("Rapid temp rise",    policy_metrics["temp_rise"],          temp_rise_limit):
+    if chk("Rapid temp rise",    policy_metrics["temp_rise"],
+           temp_rise_limit):
         return {"decision": "abort",    "reason": "rapid thermal rise"},          checks
-    if chk("Sustained overheat", policy_metrics["high_temp_duration"], high_temp_limit):
+    if chk("Sustained overheat", policy_metrics["high_temp_duration"],
+           high_temp_limit):
         return {"decision": "override", "reason": "sustained high temperature"},  checks
-    if chk("SoH loss",           policy_metrics["soh_loss"],           soh_loss_limit):
+    if chk("SoH loss",           policy_metrics["soh_loss"],
+           soh_loss_limit):
         return {"decision": "override", "reason": "excessive degradation"},       checks
-    if chk("Battery health",     1 - battery_state["soh"],             1 - health_limit):
+    if chk("Battery health",     1 - battery_state["soh"],
+           1 - health_limit):
         return {"decision": "override", "reason": "battery health low"},          checks
 
     conf = battery_state.get("confidence", 1.0)
@@ -710,8 +839,29 @@ def kill_agent(policy_metrics, battery_state,
     return {"decision": "allow", "reason": "policy safe"}, checks
 
 
-def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df):
+def run_kill_agent(df, selected_policy, transformer_state,
+                   policies, metrics_df):
     banner("AGENT 4 — KILL AGENT")
+
+    input_soh = transformer_state["soh"]
+
+    # ── FIX D: adaptive thresholds based on input SoH ────────────────────────
+    section("FIX D — Adaptive Thresholds")
+    if input_soh < 0.7:
+        soh_loss_limit = 0.0003
+        health_limit   = 0.88
+        print(f"  Input SoH={input_soh:.2f} < 0.70 → STRICT limits: "
+              f"soh_loss≤{soh_loss_limit}, health≥{health_limit}")
+    elif input_soh < 0.85:
+        soh_loss_limit = 0.0005
+        health_limit   = 0.85
+        print(f"  Input SoH={input_soh:.2f} < 0.85 → TIGHTER limits: "
+              f"soh_loss≤{soh_loss_limit}, health≥{health_limit}")
+    else:
+        soh_loss_limit = 0.001
+        health_limit   = 0.80
+        print(f"  Input SoH={input_soh:.2f} ≥ 0.85 → STANDARD limits: "
+              f"soh_loss≤{soh_loss_limit}, health≥{health_limit}")
 
     battery_state = {
         "soc":        transformer_state["soc"],
@@ -727,30 +877,36 @@ def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df)
     for k, v in metrics.items():
         print(f"  {k:<22}: {v:.6f}")
 
-    decision, checks = kill_agent(metrics, battery_state)
+    decision, checks = kill_agent(
+        metrics, battery_state,
+        soh_loss_limit=soh_loss_limit,
+        health_limit=health_limit,
+    )
 
     section("Rule trace")
     for c in checks:
         status = "BREACHED" if c["breached"] else "ok"
         bar    = c["value"] / (c["limit"] + 1e-9)
         marker = "!!" if c["breached"] else "  "
-        print(f"  {marker} {c['rule']:<24} {c['value']:.4f} / {c['limit']:.4f}  [{bar:.2f}x]  {status}")
+        print(f"  {marker} {c['rule']:<24} {c['value']:.4f} / "
+              f"{c['limit']:.4f}  [{bar:.2f}x]  {status}")
 
     section("Kill Agent Decision")
-    dec_str = decision["decision"].upper()
-    print(f"  Decision : {dec_str}")
+    print(f"  Decision : {decision['decision'].upper()}")
     print(f"  Reason   : {decision['reason']}")
 
     if decision["decision"] == "allow":
         final_policy = selected_policy
-        print(f"\n  Final policy : {int(final_policy)} — APPROVED, charging may proceed")
+        print(f"\n  Final policy : {int(final_policy)} — APPROVED")
 
     elif decision["decision"] == "override":
         safe_candidates = []
         for pid in df["solution_id"].unique():
             pol  = extract_policy(df, pid)
             mets = compute_metrics(pol)
-            dec, _ = kill_agent(mets, battery_state)
+            dec, _ = kill_agent(mets, battery_state,
+                                soh_loss_limit=soh_loss_limit,
+                                health_limit=health_limit)
             if dec["decision"] == "allow":
                 safe_candidates.append((pid, mets["soh_loss"]))
 
@@ -761,9 +917,9 @@ def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df)
             final_policy = None
             print("\n  Override → no safe policy found, charging aborted")
 
-    else:  # abort
+    else:
         final_policy = None
-        print("\n  ABORT — charging stopped, no policy executed")
+        print("\n  ABORT — charging stopped")
 
     return final_policy, decision
 
@@ -771,7 +927,6 @@ def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df)
 # ─────────────────────────────────────────────────────────────────────────────
 # FINAL OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
-
 def print_final_output(predictor_output, transformer_state,
                        selected_policy, decision, final_policy,
                        df, policies):
@@ -784,6 +939,10 @@ def print_final_output(predictor_output, transformer_state,
     print(f"  SoH          : {predictor_output['soh']:.4f}")
     print(f"  Temperature  : {predictor_output['temperature']:.2f} °C")
     print(f"  Confidence   : {predictor_output['confidence']:.3f}")
+    if predictor_output.get("ood"):
+        print(f"  ⚠  OOD bypass was triggered — raw inputs used")
+        for r in predictor_output["ood_reasons"]:
+            print(f"     • {r}")
 
     print(f"\n  {'─'*50}")
     print(f"  KILL AGENT DECISION")
@@ -803,7 +962,7 @@ def print_final_output(predictor_output, transformer_state,
         print(f"  SoH loss     : {mets['soh_loss']:.6f}")
         print(f"  Duration     : {len(pol['current'])} seconds")
         print(f"  Avg current  : {np.mean(pol['current']):.2f} A")
-        print(f"\n  STATUS: CHARGING APPROVED")
+        print(f"\n  STATUS: CHARGING APPROVED ✓")
     else:
         print(f"  STATUS: CHARGING ABORTED — no safe policy available")
 
@@ -813,22 +972,16 @@ def print_final_output(predictor_output, transformer_state,
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args():
-    p = argparse.ArgumentParser(description="BMS Multi-Agent Pipeline (FIXED)")
-    p.add_argument("--soc",     type=float, default=0.45,
-                   help="State of Charge [0-1]")
-    p.add_argument("--soh",     type=float, default=0.95,
-                   help="State of Health [0-1]")
-    p.add_argument("--temp",    type=float, default=27.0,
-                   help="Temperature in Celsius")
-    p.add_argument("--current", type=float, default=-1.5,
-                   help="Current in A (negative = discharge, positive = charge)")
-    p.add_argument("--cycle",   type=float, default=0.5,
-                   help="Normalised cycle index [0-1]")
+    p = argparse.ArgumentParser(
+        description="BMS Multi-Agent Pipeline (v2 — Inference Robustness)")
+    p.add_argument("--soc",     type=float, default=0.45)
+    p.add_argument("--soh",     type=float, default=0.95)
+    p.add_argument("--temp",    type=float, default=27.0)
+    p.add_argument("--current", type=float, default=-1.5)
+    p.add_argument("--cycle",   type=float, default=0.5)
     p.add_argument("--mode",    type=str,   default="auto",
-                   choices=["auto", "fast", "balanced", "battery_care"],
-                   help="Charging mode override")
+                   choices=["auto", "fast", "balanced", "battery_care"])
     return p.parse_args()
 
 
@@ -839,23 +992,23 @@ def main():
         "soc":        args.soc,
         "soh":        args.soh,
         "temp_C":     args.temp,
-        "current_A":  args.current,   # negative = discharge (pipeline convention)
+        "current_A":  args.current,
         "cycle_norm": args.cycle,
     }
 
     print(f"\n{SEP}")
-    print("  BMS MULTI-AGENT PIPELINE  (FIXED)")
+    print("  BMS MULTI-AGENT PIPELINE  v2")
     print(f"  Mode: {args.mode.upper()}")
     print(SEP)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n  Device: {device}")
 
-    print(f"  Loading model from {MODEL_PATH}...")
+    print(f"  Loading model    : {MODEL_PATH}")
     model = BatteryTransformer(input_dim=11).to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 
-    print(f"  Loading globals from {GLOBALS_PATH}...")
+    print(f"  Loading globals  : {GLOBALS_PATH}")
     with open(GLOBALS_PATH, "rb") as f:
         globs = pickle.load(f)
     global_mean = globs["global_mean"]
