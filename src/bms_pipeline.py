@@ -118,15 +118,11 @@ class BatteryTransformer(nn.Module):
         return soc, soh, temp
 def ocv_function(s):
     s = np.clip(s, 0.0, 1.0)
-
+    
     # Realistic Li-ion OCV polynomial (smooth S-curve)
     c0, c1, c2, c3, c4, c5 = (
-        -2.5,   # s^5
-         6.0,   # s^4
-        -5.5,   # s^3
-         2.5,   # s^2
-         0.8,   # s
-         3.0    # constant
+        25.75752864 ,-85.18817968 ,111.18268373 ,-70.79905435 , 22.48912782
+,   0.53290648
     )
 
     return (
