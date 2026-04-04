@@ -278,10 +278,21 @@ MUT_PROB      = 0.1
 MUT_STD       = 0.3
 
 
-def ocv_function(soc):
-    soc = np.clip(soc, 0.0, 1.0)
-    return 3.0 + 1.2*soc - 0.3*np.exp(-5*soc) + 0.1*np.exp(-5*(1 - soc))
+def ocv_function(s):
+    s_safe = np.clip(s, 0.15, 0.95)
+    
+    c0, c1, c2, c3, c4, c5 = (
+        25.75752864 ,-85.18817968 ,111.18268373 ,-70.79905435 , 22.48912782 , 0.53290648
+    )
 
+    return (
+        c0*(s_safe**5) +
+        c1*(s_safe**4) +
+        c2*(s_safe**3) +
+        c3*(s_safe**2) +
+        c4*s_safe +
+        c5
+    )
 
 def ecm_step(soc, soh, current, dt, params):
     Q        = params["capacity_Ah"] * soh * 3600
@@ -390,7 +401,7 @@ def run_nsga2(state):
         NSGA2(pop_size=60, sampling=FloatRandomSampling(),
               crossover=SBX(prob=0.9, eta=15),
               mutation=PM(eta=20), eliminate_duplicates=True),
-        termination=("n_gen", 40), seed=1, verbose=False
+        termination=("n_gen", 40), seed=None, verbose=False
     )
     return result.X, result.F
 
