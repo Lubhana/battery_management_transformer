@@ -293,12 +293,17 @@ if st.sidebar.button("Run Simulation", type="primary"):
                     help="Cycles remaining until SoH hits 80% (end-of-life threshold)",
                 )
             else:
+                projected_rul = None 
                 st.metric("Estimated RUL", "∞ — No measurable damage")
 
         with rul_col2:
             # Mini SoH degradation projection chart
             if soh_loss_per_cycle > 1e-9:
-                max_cycles = min(projected_rul + 50, 5000)
+                if projected_rul is not None:
+                    max_cycles = min(projected_rul + 50, 5000)
+                else:
+                    max_cycles = 5000
+            
                 cycle_range = np.arange(0, max_cycles, max(1, max_cycles // 200))
                 soh_proj    = current_soh - soh_loss_per_cycle * cycle_range
                 soh_proj    = np.clip(soh_proj, 0, 1)
