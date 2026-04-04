@@ -312,22 +312,22 @@ MUT_PROB      = 0.1
 MUT_STD       = 0.3
 
 
-def ocv_function(soc):
-    soc = np.clip(soc, 0.0, 1.0)
-    return 3.0 + 1.2*soc - 0.3*np.exp(-5*soc) + 0.1*np.exp(-5*(1 - soc))
-
-
 def ecm_step(soc, soh, current, dt, params):
-    Q        = params["capacity_Ah"] * soh * 3600
-    soc_next = np.clip(soc + (abs(current) * dt) / Q, 0.0, 1.0)
-    R0       = params["R0_nominal"] * (1.0 / max(soh, 0.01))
-    voltage  = ocv_function(soc) + abs(current) * R0
+    Q = params["capacity_Ah"] * soh * 3600
+
+    soc_next = np.clip(soc + (current * dt) / Q, 0.0, 1.0)
+
+    R0 = params["R0_nominal"] * (1.0 / max(soh, 0.01))
+
+    voltage = ocv_function(soc) + current * R0
+
     return soc_next, voltage, R0
 
 
 def thermal_step(temp, current, R0, params, dt):
     heat_gen  = (current ** 2) * R0
     heat_loss = (temp - params["T_amb"]) / params["R_th"]
+
     return temp + (dt / params["C_th"]) * (heat_gen - heat_loss)
 
 
@@ -339,22 +339,32 @@ def degradation_step(soh, current, temp, dt):
 def simulate_charging(profile, state, params, log_trajectory=False):
     soc, soh, temp = state["soc"], state["soh"], state["temp"]
     dt = params["dt"]
+
     soc_t, temp_t, soh_t = [], [], []
 
     for current in profile:
         soc, voltage, R0 = ecm_step(soc, soh, current, dt, params)
         temp = thermal_step(temp, current, R0, params, dt)
         soh  = degradation_step(soh, current, temp, dt)
+
         if voltage > params["V_max"] or temp > params["T_max"]:
             return None
+
+        if soc >= 1.0:
+            break
+
         if log_trajectory:
-            soc_t.append(soc); temp_t.append(temp); soh_t.append(soh)
+            soc_t.append(soc)
+            temp_t.append(temp)
+            soh_t.append(soh)
 
     charging_time = len(profile) * dt
-    soh_loss      = state["soh"] - soh
+    soh_loss = state["soh"] - soh
+
     if log_trajectory:
         return charging_time, soh_loss, soc_t, temp_t, soh_t
-    return charging_time, temp, soh_loss, soc
+
+    return charging_time, soh_loss, soc, temp
 
 
 def fitness_function(sim_result, state):
