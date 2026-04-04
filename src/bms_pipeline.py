@@ -116,7 +116,6 @@ class BatteryTransformer(nn.Module):
                           self.temp_logvar_head(temp_f.detach())], dim=1)
         return soc, soh, temp
 
-
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
@@ -125,8 +124,8 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     soc   = battery_input["soc"]
     soh   = battery_input["soh"]
-    temp  = battery_input["temp_C"]      # Celsius
-    curr  = battery_input["current_A"]   # negative = discharge
+    temp  = battery_input["temp_C"]      
+    curr  = battery_input["current_A"]   
     cycle = battery_input.get("cycle_norm", 0.5)
 
     # Base ECM parameters matched to ECM.ipynb
@@ -141,6 +140,16 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     def ocv_function(s):
         s = np.clip(s, 0.0, 1.0)
+        # =====================================================================
+        # TODO: PASTE YOUR 5TH DEGREE POLYNOMIAL COEFFICIENTS FROM ECM.IPYNB HERE
+        # Run your Jupyter Notebook, print(coeffs), and replace these numbers!
+        # =====================================================================
+        c0, c1, c2, c3, c4, c5 = 0.0, 0.0, 0.0, 0.0, 0.0, 3.5 # Replace these!
+        
+        # Uncomment the line below once you put your real coefficients in:
+        # return c0*(s**5) + c1*(s**4) + c2*(s**3) + c3*(s**2) + c4*s + c5
+        
+        # (Temporary fallback until you paste your coeffs)
         return 3.0 + 1.2*s - 0.3*np.exp(-5*s) + 0.1*np.exp(-5*(1 - s))
 
     current_soc = soc
@@ -187,33 +196,25 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # --- THE SECONDS FIX ---
-    mode_flag   = 1.0 if curr < 0 else 0.0
+    # --- REVERTED TO YOUR ORIGINAL [0, 1] NORMALIZATION ---
+    mode_flag    = 1.0 if curr < 0 else 0.0
     mode_col     = np.full((seq_len, 1), mode_flag)
-
-    # 1. Calculate actual elapsed SECONDS based on missing Capacity
-    total_cycle_time = (Q_actual * 3600.0) / max(I_load, 0.1)
-    elapsed_seconds = total_cycle_time * (1.0 - soc)
-    
-    # 2. Time_uniform matches the NASA dataset (Counting actual seconds)
-    time_uniform = np.arange(elapsed_seconds, elapsed_seconds + seq_len * dt, dt).reshape(-1, 1)
-
-    # 3. Pass the exact cycle argument you provide
-    cycle_index = np.full((seq_len, 1), cycle)
-    # -----------------------
+    time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
+    cycle_index  = np.full((seq_len, 1), cycle)
+    # ------------------------------------------------------
     
     features = np.concatenate([
-        data_norm[:, 0:1],   # Voltage_measured
-        data_norm[:, 1:2],   # Current_measured
-        time_uniform,        # Time_uniform
-        data_norm[:, 2:3],   # dV_dt
-        data_norm[:, 3:4],   # dT_dt
-        mode_col,            # mode_flag
-        data_norm[:, 4:5],   # V_RC_masked
-        data_norm[:, 5:6],   # V_ECM_masked
-        data_norm[:, 6:7],   # power
-        cycle_index,         # cycle_index
-        data_norm[:, 7:8],   # Temperature_measured
+        data_norm[:, 0:1],   
+        data_norm[:, 1:2],   
+        time_uniform,        
+        data_norm[:, 2:3],   
+        data_norm[:, 3:4],   
+        mode_col,            
+        data_norm[:, 4:5],   
+        data_norm[:, 5:6],   
+        data_norm[:, 6:7],   
+        cycle_index,         
+        data_norm[:, 7:8],   
     ], axis=1)               
 
     return features.astype(np.float32)
