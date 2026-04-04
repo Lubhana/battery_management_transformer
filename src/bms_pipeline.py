@@ -43,7 +43,7 @@ DATA_DIR     ='dataset/ECM_processed_cycles'
 # ─────────────────────────────────────────────────────────────────────────────
 SEP  = "=" * 60
 SEP2 = "-" * 60
-
+HORIZON_SEC = 600
 def banner(title):
     print(f"\n{SEP}")
     print(f"  {title}")
