@@ -116,6 +116,27 @@ class BatteryTransformer(nn.Module):
         temp = torch.cat([self.temp_mu_head(temp_f),
                           self.temp_logvar_head(temp_f.detach())], dim=1)
         return soc, soh, temp
+def ocv_function(s):
+    s = np.clip(s, 0.0, 1.0)
+
+    # Realistic Li-ion OCV polynomial (smooth S-curve)
+    c0, c1, c2, c3, c4, c5 = (
+        -2.5,   # s^5
+         6.0,   # s^4
+        -5.5,   # s^3
+         2.5,   # s^2
+         0.8,   # s
+         3.0    # constant
+    )
+
+    return (
+        c0*(s**5) +
+        c1*(s**4) +
+        c2*(s**3) +
+        c3*(s**2) +
+        c4*s +
+        c5
+    )
 
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     """
@@ -144,13 +165,6 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     I = curr  # ✅ same convention as notebook
 
-    # ================= OCV FUNCTION =================
-    def ocv_function(s):
-        s = np.clip(s, 0.0, 1.0)
-
-        # 🔥 REPLACE WITH YOUR REAL COEFFS FROM NOTEBOOK
-        # Example placeholder:
-        return 3.0 + 1.2*s - 0.3*np.exp(-5*s) + 0.1*np.exp(-5*(1 - s))
 
     # ================= INITIAL STATES =================
     current_soc = soc
