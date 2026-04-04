@@ -115,7 +115,6 @@ class BatteryTransformer(nn.Module):
         temp = torch.cat([self.temp_mu_head(temp_f),
                           self.temp_logvar_head(temp_f.detach())], dim=1)
         return soc, soh, temp
-
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
@@ -124,98 +123,106 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
 
     soc   = battery_input["soc"]
     soh   = battery_input["soh"]
-    temp  = battery_input["temp_C"]      
-    curr  = battery_input["current_A"]   
+    temp  = battery_input["temp_C"]
+    curr  = battery_input["current_A"]   # IMPORTANT: keep raw
     cycle = battery_input.get("cycle_norm", 0.5)
 
-    # Base ECM parameters matched to ECM.ipynb
-    Q_rated = 2.3  
+    # ECM params (same as notebook)
+    Q_rated = 2.3
     R1 = 0.01
     C1 = 2000.0
     dt = 1.0
 
+    # Degradation effect
     R0 = 0.02 * (1.0 / max(soh, 0.01))
     Q_actual = Q_rated * max(soh, 0.01)
-    I_load = -curr if curr < 0 else 0.0
 
+    # ✅ CURRENT FIX: Use same convention as notebook
+    I = curr   # discharge = positive
+
+    # ✅ OCV FUNCTION (PUT YOUR REAL COEFFS HERE)
     def ocv_function(s):
         s = np.clip(s, 0.0, 1.0)
-        # =====================================================================
-        # TODO: PASTE YOUR 5TH DEGREE POLYNOMIAL COEFFICIENTS FROM ECM.IPYNB HERE
-        # Run your Jupyter Notebook, print(coeffs), and replace these numbers!
-        # =====================================================================
-        c0, c1, c2, c3, c4, c5 = 0.0, 0.0, 0.0, 0.0, 0.0, 3.5 # Replace these!
-        
-        # Uncomment the line below once you put your real coefficients in:
-        # return c0*(s**5) + c1*(s**4) + c2*(s**3) + c3*(s**2) + c4*s + c5
-        
-        # (Temporary fallback until you paste your coeffs)
-        return 3.0 + 1.2*s - 0.3*np.exp(-5*s) + 0.1*np.exp(-5*(1 - s))
+
+        # 🔥 Paste your coeffs from ECM.ipynb
+        # Example:
+        # c0, c1, c2, c3, c4, c5 = coeffs
+
+        return 3.0 + 1.2 * s   # temporary fallback
 
     current_soc = soc
     current_temp = temp
     V_RC = 0.0
-    prev_volt = ocv_function(current_soc) - I_load * R0
+    prev_volt = ocv_function(current_soc) - I * R0
 
     rows = []
+
     for t in range(seq_len):
-        current_soc -= (I_load * dt) / (3600.0 * Q_actual)
+
+        # ✅ SOC update (FIXED)
+        current_soc -= (I * dt) / (3600.0 * Q_actual)
         current_soc = np.clip(current_soc, 0.0, 1.0)
 
+        # RC dynamics (same as notebook)
         alpha = np.exp(-dt / (R1 * C1))
-        V_RC = alpha * V_RC + R1 * (1 - alpha) * I_load
+        V_RC = alpha * V_RC + R1 * (1 - alpha) * I
 
+        # ECM voltage
         OCV = ocv_function(current_soc)
-        V_ecm = OCV - I_load * R0 - V_RC
+        V_ecm = OCV - I * R0 - V_RC
 
-        heat_gen = (curr ** 2) * R0
-        heat_loss = (current_temp - 25.0) / 2.0  
-        dT = (dt / 400.0) * (heat_gen - heat_loss) 
+        # Temperature model (keep yours)
+        heat_gen = (I ** 2) * R0
+        heat_loss = (current_temp - 25.0) / 2.0
+        dT = (dt / 400.0) * (heat_gen - heat_loss)
         current_temp += dT
 
+        # derivatives
         dV_dt = V_ecm - prev_volt
         dT_dt = dT
-        power = V_ecm * curr
+        power = V_ecm * I   # ✅ consistent sign
+
         prev_volt = V_ecm
 
         row = np.array([
-            V_ecm,            
-            curr,             
-            dV_dt,            
-            dT_dt,            
-            V_RC,             
-            V_ecm,            
-            power,            
-            current_temp,     
+            V_ecm,
+            I,
+            dV_dt,
+            dT_dt,
+            V_RC,
+            V_ecm,
+            power,
+            current_temp,
         ])
+
         rows.append(row)
 
-    data = np.stack(rows) 
+    data = np.stack(rows)
 
+    # normalization
     mean_vals = global_mean[num_cols].values
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # --- REVERTED TO YOUR ORIGINAL [0, 1] NORMALIZATION ---
-    mode_flag    = 1.0 if curr < 0 else 0.0
+    # extra features
+    mode_flag    = 1.0 if I < 0 else 0.0  # charging flag
     mode_col     = np.full((seq_len, 1), mode_flag)
     time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
     cycle_index  = np.full((seq_len, 1), cycle)
-    # ------------------------------------------------------
-    
+
     features = np.concatenate([
-        data_norm[:, 0:1],   
-        data_norm[:, 1:2],   
-        time_uniform,        
-        data_norm[:, 2:3],   
-        data_norm[:, 3:4],   
-        mode_col,            
-        data_norm[:, 4:5],   
-        data_norm[:, 5:6],   
-        data_norm[:, 6:7],   
-        cycle_index,         
-        data_norm[:, 7:8],   
-    ], axis=1)               
+        data_norm[:, 0:1],
+        data_norm[:, 1:2],
+        time_uniform,
+        data_norm[:, 2:3],
+        data_norm[:, 3:4],
+        mode_col,
+        data_norm[:, 4:5],
+        data_norm[:, 5:6],
+        data_norm[:, 6:7],
+        cycle_index,
+        data_norm[:, 7:8],
+    ], axis=1)
 
     return features.astype(np.float32)
 
