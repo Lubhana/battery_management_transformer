@@ -62,38 +62,44 @@ def section(title):
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=500):
         super().__init__()
-        pe       = torch.zeros(max_len, d_model)
+        pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
 
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
 
+# ─── CELL 9: MODEL ───
 class BatteryTransformer(nn.Module):
     def __init__(self, input_dim=11, d_model=128, nhead=4, num_layers=2, dropout=0.2):
         super().__init__()
-        self.input_proj  = nn.Linear(input_dim, d_model)
+        self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
 
-        enc_layer = nn.TransformerEncoderLayer(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
-            dim_feedforward=256, dropout=dropout, batch_first=True
+            dim_feedforward=256, dropout=dropout,
+            batch_first=True
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        dec_layer = nn.TransformerDecoderLayer(
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead,
-            dim_feedforward=256, dropout=dropout, batch_first=True
+            dim_feedforward=256, dropout=dropout,
+            batch_first=True
         )
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        self.query_embed      = nn.Parameter(torch.randn(1, 3, d_model))
+        # 3 query tokens — one per target
+        self.query_embed = nn.Parameter(torch.randn(1, 3, d_model))
+
         self.soc_mu_head      = nn.Linear(d_model, 1)
         self.soc_logvar_head  = nn.Linear(d_model, 1)
         self.soh_mu_head      = nn.Linear(d_model, 1)
@@ -101,21 +107,33 @@ class BatteryTransformer(nn.Module):
         self.temp_mu_head     = nn.Linear(d_model, 1)
         self.temp_logvar_head = nn.Linear(d_model, 1)
 
+        for head in [self.soc_logvar_head, self.soh_logvar_head, self.temp_logvar_head]:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
     def forward(self, x):
-        bs      = x.size(0)
-        x       = self.pos_encoder(self.input_proj(x))
-        memory  = self.encoder(x)
-        queries = self.query_embed.expand(bs, -1, -1)
+        batch_size = x.size(0)
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        memory = self.encoder(x)
+
+        queries = self.query_embed.expand(batch_size, -1, -1)
         decoded = self.decoder(queries, memory)
 
-        soc_f, soh_f, temp_f = decoded[:, 0], decoded[:, 1], decoded[:, 2]
+        soc_feat  = decoded[:, 0, :]
+        soh_feat  = decoded[:, 1, :]
+        temp_feat = decoded[:, 2, :]
 
-        soc  = torch.cat([self.soc_mu_head(soc_f),
-                          self.soc_logvar_head(soc_f.detach())],  dim=1)
-        soh  = torch.cat([self.soh_mu_head(soh_f),
-                          self.soh_logvar_head(soh_f.detach())],  dim=1)
-        temp = torch.cat([self.temp_mu_head(temp_f),
-                          self.temp_logvar_head(temp_f.detach())], dim=1)
+        soc_mu      = self.soc_mu_head(soc_feat)
+        soc_logvar  = self.soc_logvar_head(soc_feat.detach())
+        soh_mu      = self.soh_mu_head(soh_feat)
+        soh_logvar  = self.soh_logvar_head(soh_feat.detach())
+        temp_mu     = self.temp_mu_head(temp_feat)
+        temp_logvar = self.temp_logvar_head(temp_feat.detach())
+
+        soc  = torch.cat([soc_mu,  soc_logvar],  dim=1)
+        soh  = torch.cat([soh_mu,  soh_logvar],  dim=1)
+        temp = torch.cat([temp_mu, temp_logvar], dim=1)
         return soc, soh, temp
 
 
