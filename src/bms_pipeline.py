@@ -33,10 +33,11 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS  — edit these to match your Kaggle/local environment
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_PATH   = 'models/best_model.pt'
-GLOBALS_PATH = 'models/predictor_globals.pkl'
-DATASET_PATH = 'dataset/nsga2_synthetic_dataset.csv'
-DATA_DIR     ='dataset/ECM_processed_cycles'
+MODEL_PATH   = '/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/multihead-attention-transformer/best_model.pt'
+GLOBALS_PATH = '/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/linking/BMS/codes/predictor_globals.pkl'
+DATASET_PATH = '/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/linking/BMS/codes/nsga2_synthetic_dataset.csv'
+DATA_DIR     ='/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/ECM_processed_cycles'
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,114 +116,69 @@ class BatteryTransformer(nn.Module):
         temp = torch.cat([self.temp_mu_head(temp_f),
                           self.temp_logvar_head(temp_f.detach())], dim=1)
         return soc, soh, temp
+
+
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
+    """
+    Builds a (seq_len, 11) feature tensor from a single battery state dict.
+    In production this would come from real sensor readings.
+    Here we construct a plausible sequence from the given scalar inputs.
+    """
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
         'V_RC_masked', 'V_ECM_masked', 'power', 'Temperature_measured'
     ]
 
+    # Build synthetic sequence — constant values with tiny noise
     soc   = battery_input["soc"]
-    soh   = battery_input["soh"]
-    temp  = battery_input["temp_C"]
-    curr  = battery_input["current_A"]   # IMPORTANT: keep raw
-    cycle = battery_input.get("cycle_norm", 0.5)
-
-    # ECM params (same as notebook)
-    Q_rated = 2.3
-    R1 = 0.01
-    C1 = 2000.0
-    dt = 1.0
-
-    # Degradation effect
-    R0 = 0.02 * (1.0 / max(soh, 0.01))
-    Q_actual = Q_rated * max(soh, 0.01)
-
-    # ✅ CURRENT FIX: Use same convention as notebook
-    I = curr   # discharge = positive
-
-    # ✅ OCV FUNCTION (PUT YOUR REAL COEFFS HERE)
-    def ocv_function(s):
-        s = np.clip(s, 0.0, 1.0)
-
-        # 🔥 Paste your coeffs from ECM.ipynb
-        # Example:
-        # c0, c1, c2, c3, c4, c5 = coeffs
-
-        return 3.0 + 1.2 * s   # temporary fallback
-
-    current_soc = soc
-    current_temp = temp
-    V_RC = 0.0
-    prev_volt = ocv_function(current_soc) - I * R0
+    temp  = battery_input["temp_C"]      # Celsius
+    curr  = battery_input["current_A"]   # negative = discharge
+    volt  = 3.0 + 1.2 * soc             # approximate OCV
 
     rows = []
-
     for t in range(seq_len):
-
-        # ✅ SOC update (FIXED)
-        current_soc -= (I * dt) / (3600.0 * Q_actual)
-        current_soc = np.clip(current_soc, 0.0, 1.0)
-
-        # RC dynamics (same as notebook)
-        alpha = np.exp(-dt / (R1 * C1))
-        V_RC = alpha * V_RC + R1 * (1 - alpha) * I
-
-        # ECM voltage
-        OCV = ocv_function(current_soc)
-        V_ecm = OCV - I * R0 - V_RC
-
-        # Temperature model (keep yours)
-        heat_gen = (I ** 2) * R0
-        heat_loss = (current_temp - 25.0) / 2.0
-        dT = (dt / 400.0) * (heat_gen - heat_loss)
-        current_temp += dT
-
-        # derivatives
-        dV_dt = V_ecm - prev_volt
-        dT_dt = dT
-        power = V_ecm * I   # ✅ consistent sign
-
-        prev_volt = V_ecm
-
+        noise = np.random.normal(0, 0.001, 8)
         row = np.array([
-            V_ecm,
-            I,
-            dV_dt,
-            dT_dt,
-            V_RC,
-            V_ecm,
-            power,
-            current_temp,
+            volt  + noise[0],          # Voltage_measured
+            curr  + noise[1],          # Current_measured
+            noise[2],                  # dV_dt
+            noise[3],                  # dT_dt
+            0.0   + noise[4],          # V_RC_masked (discharge only)
+            0.0   + noise[5],          # V_ECM_masked
+            volt * curr + noise[6],    # power
+            temp  + noise[7],          # Temperature_measured
         ])
-
         rows.append(row)
 
-    data = np.stack(rows)
+    data = np.stack(rows)  # (seq_len, 8)
 
-    # normalization
+    # normalise the 8 numeric cols
     mean_vals = global_mean[num_cols].values
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # extra features
-    mode_flag    = 1.0 if I < 0 else 0.0  # charging flag
-    mode_col     = np.full((seq_len, 1), mode_flag)
+    # extra features (not normalised)
+    mode_flag   = 1.0 if curr < 0 else 0.0
     time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
-    cycle_index  = np.full((seq_len, 1), cycle)
+    cycle_index  = np.full((seq_len, 1), battery_input.get("cycle_norm", 0.5))
+    mode_col     = np.full((seq_len, 1), mode_flag)
 
+    # final feature order matches BatteryDataset:
+    # Voltage, Current, Time_uniform, dV_dt, dT_dt,
+    # mode_flag, V_RC_masked, V_ECM_masked, power, cycle_index, Temperature
     features = np.concatenate([
-        data_norm[:, 0:1],
-        data_norm[:, 1:2],
-        time_uniform,
-        data_norm[:, 2:3],
-        data_norm[:, 3:4],
-        mode_col,
-        data_norm[:, 4:5],
-        data_norm[:, 5:6],
-        data_norm[:, 6:7],
-        cycle_index,
-        data_norm[:, 7:8],
-    ], axis=1)
+        data_norm[:, 0:1],   # Voltage_measured
+        data_norm[:, 1:2],   # Current_measured
+        time_uniform,        # Time_uniform
+        data_norm[:, 2:3],   # dV_dt
+        data_norm[:, 3:4],   # dT_dt
+        mode_col,            # mode_flag
+        data_norm[:, 4:5],   # V_RC_masked
+        data_norm[:, 5:6],   # V_ECM_masked
+        data_norm[:, 6:7],   # power
+        cycle_index,         # cycle_index
+        data_norm[:, 7:8],   # Temperature_measured
+    ], axis=1)               # (seq_len, 11)
 
     return features.astype(np.float32)
 
@@ -249,11 +205,13 @@ def run_predictor(battery_input, model, global_mean, global_std, device):
     temp_mu     = float(temp_out[0, 0])
     temp_logvar = float(torch.clamp(temp_out[0, 1], -2, 2))
 
+    # confidence: higher = more certain
     soc_conf  = float(1 / (1 + np.exp(soc_logvar)))
     soh_conf  = float(1 / (1 + np.exp(soh_logvar)))
     temp_conf = float(1 / (1 + np.exp(temp_logvar)))
     avg_conf  = (soc_conf + soh_conf + temp_conf) / 3.0
 
+    # temperature is normalised — denormalise back to Celsius
     temp_mean = float(global_mean["Temperature_measured"])
     temp_std  = float(global_std["Temperature_measured"])
     temp_real = temp_mu * temp_std + temp_mean
@@ -263,6 +221,7 @@ def run_predictor(battery_input, model, global_mean, global_std, device):
         "soh":        np.clip(soh_mu, 0.0, 1.0),
         "temperature": temp_real,
         "confidence": avg_conf,
+        # per-target confidences
         "soc_conf":   soc_conf,
         "soh_conf":   soh_conf,
         "temp_conf":  temp_conf,
@@ -326,34 +285,25 @@ def degradation_step(soh, current, temp, dt):
     stress = abs(current) * max(0.0, temp - 298.0)
     return max(0.0, soh - 5e-9 * stress * dt)
 
+
 def simulate_charging(profile, state, params, log_trajectory=False):
     soc, soh, temp = state["soc"], state["soh"], state["temp"]
     dt = params["dt"]
     soc_t, temp_t, soh_t = [], [], []
-    actual_profile = [] 
 
     for current in profile:
-        ocv = ocv_function(soc)
-        R0 = params["R0_nominal"] * (1.0 / max(soh, 0.01))
-        
-        if ocv + abs(current) * R0 > params["V_max"]:
-            current = max(0.0, (params["V_max"] - ocv) / R0)
-
         soc, voltage, R0 = ecm_step(soc, soh, current, dt, params)
         temp = thermal_step(temp, current, R0, params, dt)
         soh  = degradation_step(soh, current, temp, dt)
-        
-        if temp > params["T_max"]:
-            return None 
-
+        if voltage > params["V_max"] or temp > params["T_max"]:
+            return None
         if log_trajectory:
             soc_t.append(soc); temp_t.append(temp); soh_t.append(soh)
-            actual_profile.append(current) 
 
     charging_time = len(profile) * dt
     soh_loss      = state["soh"] - soh
     if log_trajectory:
-        return charging_time, soh_loss, soc_t, temp_t, soh_t, actual_profile
+        return charging_time, soh_loss, soc_t, temp_t, soh_t
     return charging_time, temp, soh_loss, soc
 
 
@@ -424,7 +374,7 @@ def run_nsga2(state):
         NSGA2(pop_size=60, sampling=FloatRandomSampling(),
               crossover=SBX(prob=0.9, eta=15),
               mutation=PM(eta=20), eliminate_duplicates=True),
-        termination=("n_gen", 40), seed=None, verbose=False
+        termination=("n_gen", 40), seed=1, verbose=False
     )
     return result.X, result.F
 
@@ -435,23 +385,23 @@ def build_synthetic_dataset(pareto_profiles, state):
         res = simulate_charging(profile, state, BATTERY_PARAMS, log_trajectory=True)
         if res is None:
             continue
-            
-        _, _, soc_t, temp_t, soh_t, actual_profile = res
-        
-        for t in range(len(actual_profile)):
+        _, _, soc_t, temp_t, soh_t = res
+        for t in range(len(profile)):
             rows.append({
                 "solution_id":   sol_id,
                 "time_s":        t,
-                "current_A":     actual_profile[t], 
+                "current_A":     profile[t],
                 "SoC":           soc_t[t],
                 "temperature_K": temp_t[t],
                 "SoH":           soh_t[t],
             })
     return pd.DataFrame(rows)
-  
+
+
 def run_simulator_optimiser(predictor_output):
     banner("AGENT 2 — SIMULATOR + OPTIMISER")
 
+    # temperature: Predictor outputs Celsius, Simulator uses Kelvin
     transformer_state = {
         "soc":        predictor_output["soc"],
         "soh":        predictor_output["soh"],
@@ -459,15 +409,50 @@ def run_simulator_optimiser(predictor_output):
         "confidence": predictor_output["confidence"],
     }
 
-    section("NSGA-II multi-objective optimisation")
-    print("  Running NSGA-II (40 generations, 60 individuals)...")
-    
-    pareto_profiles, pareto_F = run_nsga2(transformer_state)
-    
-    section("Building synthetic dataset")
-    df = build_synthetic_dataset(pareto_profiles, transformer_state)
-    
+    section("Simulator — ECM physics check")
+    test_profile = np.full(60, 1.5)   # 1-minute test at 1.5A
+    test_result  = simulate_charging(test_profile, transformer_state, BATTERY_PARAMS)
+    if test_result:
+        _, peak_t, soh_loss, final_soc = test_result
+        print(f"  1-min test sim at 1.5A:")
+        print(f"    Final SoC  : {final_soc:.4f}")
+        print(f"    Peak temp  : {peak_t:.2f} K")
+        print(f"    SoH loss   : {soh_loss:.6f}")
+    else:
+        print("  Test simulation hit safety limit — battery state extreme")
+
+    # ── check if dataset already exists ──────────────────────────────────────
+    if os.path.exists(DATASET_PATH):
+        section("Loading existing nsga2_synthetic_dataset.csv")
+        df = pd.read_csv(DATASET_PATH)
+        print(f"  Loaded {len(df):,} rows | {df['solution_id'].nunique()} solutions")
+        pareto_profiles = None   # not needed — dataset already built
+    else:
+        section("GA optimisation")
+        best_ga = run_ga(transformer_state)
+        res_ga  = simulate_charging(best_ga, transformer_state, BATTERY_PARAMS)
+        if res_ga:
+            _, _, _, best_soc = res_ga
+            print(f"\n  GA best profile → final SoC: {best_soc:.4f}")
+
+        section("NSGA-II multi-objective optimisation")
+        print("  Running NSGA-II (40 generations, 60 individuals)...")
+        pareto_profiles, pareto_F = run_nsga2(transformer_state)
+        soc_gains  = -pareto_F[:, 0]
+        peak_temps =  pareto_F[:, 1]
+        soh_losses =  pareto_F[:, 2]
+        print(f"  Pareto front: {len(pareto_profiles)} solutions")
+        print(f"    SoC gain range  : {soc_gains.min():.4f} — {soc_gains.max():.4f}")
+        print(f"    Peak temp range : {peak_temps.min():.2f} — {peak_temps.max():.2f} K")
+        print(f"    SoH loss range  : {soh_losses.min():.6f} — {soh_losses.max():.6f}")
+
+        section("Building synthetic dataset")
+        df = build_synthetic_dataset(pareto_profiles, transformer_state)
+        df.to_csv(DATASET_PATH, index=False)
+        print(f"  Saved {len(df):,} rows → {DATASET_PATH}")
+
     return df, transformer_state
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 3 — META-AGENT
@@ -618,6 +603,7 @@ def kill_agent(policy_metrics, battery_state,
 
     return {"decision": "allow", "reason": "policy safe"}, checks
 
+
 def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df):
     banner("AGENT 4 — KILL AGENT")
 
@@ -637,10 +623,25 @@ def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df)
 
     decision, checks = kill_agent(metrics, battery_state)
 
+    section("Rule trace")
+    for c in checks:
+        status = "BREACHED" if c["breached"] else "ok"
+        bar    = c["value"] / (c["limit"] + 1e-9)
+        marker = "!!" if c["breached"] else "  "
+        print(f"  {marker} {c['rule']:<24} {c['value']:.4f} / {c['limit']:.4f}  [{bar:.2f}x]  {status}")
+
+    section("Kill Agent Decision")
+    dec_str = decision["decision"].upper()
+    print(f"  Decision : {dec_str}")
+    print(f"  Reason   : {decision['reason']}")
+
+    # resolve final policy
     if decision["decision"] == "allow":
         final_policy = selected_policy
-        print(f"\n  Final policy : {int(final_policy)} — APPROVED")
+        print(f"\n  Final policy : {int(final_policy)} — APPROVED, charging may proceed")
+
     elif decision["decision"] == "override":
+        # find safest approved policy from Pareto set
         safe_candidates = []
         for pid in df["solution_id"].unique():
             pol  = extract_policy(df, pid)
@@ -654,12 +655,14 @@ def run_kill_agent(df, selected_policy, transformer_state, policies, metrics_df)
             print(f"\n  Override → safest approved policy: {int(final_policy)}")
         else:
             final_policy = None
-            print("\n  Override → no safe policy found")
-    else:  
+            print("\n  Override → no safe policy found, charging aborted")
+
+    else:  # abort
         final_policy = None
-        print("\n  ABORT — charging stopped")
+        print("\n  ABORT — charging stopped, no policy executed")
 
     return final_policy, decision
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FINAL OUTPUT
@@ -736,6 +739,7 @@ def main():
     print(f"  Mode: {args.mode.upper()}")
     print(SEP)
 
+    # ── load model and globals ────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n  Device: {device}")
 
@@ -749,10 +753,12 @@ def main():
     global_mean = globs["global_mean"]
     global_std  = globs["global_std"]
 
+    # ── run pipeline ──────────────────────────────────────────────────────────
     predictor_output = run_predictor(battery_input, model, global_mean, global_std, device)
 
     df, transformer_state = run_simulator_optimiser(predictor_output)
 
+    # attach confidence to transformer_state for downstream agents
     transformer_state["confidence"] = predictor_output["confidence"]
 
     selected_policy, policies, metrics_df, policy_choices = run_meta_agent(
