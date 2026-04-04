@@ -847,20 +847,20 @@ def run_kill_agent(df, selected_policy, transformer_state,
 
     # ── FIX D: adaptive thresholds based on input SoH ────────────────────────
     section("FIX D — Adaptive Thresholds")
-    if input_soh < 0.7:
+    if input_soh < 0.5:
         soh_loss_limit = 0.0003
-        health_limit   = 0.88
-        print(f"  Input SoH={input_soh:.2f} < 0.70 → STRICT limits: "
+        health_limit   = 0.5
+        print(f"  Input SoH={input_soh:.2f} < 0.50 → STRICT limits: "
               f"soh_loss≤{soh_loss_limit}, health≥{health_limit}")
-    elif input_soh < 0.85:
+    elif input_soh < 0.65:
         soh_loss_limit = 0.0005
-        health_limit   = 0.85
-        print(f"  Input SoH={input_soh:.2f} < 0.85 → TIGHTER limits: "
+        health_limit   = 0.55
+        print(f"  Input SoH={input_soh:.2f} < 0.65 → TIGHTER limits: "
               f"soh_loss≤{soh_loss_limit}, health≥{health_limit}")
     else:
         soh_loss_limit = 0.001
-        health_limit   = 0.80
-        print(f"  Input SoH={input_soh:.2f} ≥ 0.85 → STANDARD limits: "
+        health_limit   = 0.60
+        print(f"  Input SoH={input_soh:.2f} ≥ 0.60 → STANDARD limits: "
               f"soh_loss≤{soh_loss_limit}, health≥{health_limit}")
 
     battery_state = {
