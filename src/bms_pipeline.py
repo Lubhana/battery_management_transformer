@@ -117,71 +117,121 @@ class BatteryTransformer(nn.Module):
                           self.temp_logvar_head(temp_f.detach())], dim=1)
         return soc, soh, temp
 
-
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     """
-    Builds a (seq_len, 11) feature tensor from a single battery state dict.
-    In production this would come from real sensor readings.
-    Here we construct a plausible sequence from the given scalar inputs.
+    Builds a (seq_len, 11) feature tensor using ECM logic (from your notebook)
     """
+
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
         'V_RC_masked', 'V_ECM_masked', 'power', 'Temperature_measured'
     ]
 
-    # Build synthetic sequence — constant values with tiny noise
     soc   = battery_input["soc"]
-    temp  = battery_input["temp_C"]      # Celsius
-    curr  = battery_input["current_A"]   # negative = discharge
-    volt  = 3.0 + 1.2 * soc             # approximate OCV
+    soh   = battery_input.get("soh", 1.0)
+    temp  = battery_input["temp_C"]
+    curr  = battery_input["current_A"]   # ⚠️ KEEP RAW SIGN
+    cycle = battery_input.get("cycle_norm", 0.5)
+
+    # ================= ECM PARAMETERS =================
+    Q_rated = 2.3
+    R1 = 0.01
+    C1 = 2000.0
+    dt = 1.0
+
+    R0 = 0.02 * (1.0 / max(soh, 0.01))
+    Q_actual = Q_rated * max(soh, 0.01)
+
+    I = curr  # ✅ same convention as notebook
+
+    # ================= OCV FUNCTION =================
+    def ocv_function(s):
+        s = np.clip(s, 0.0, 1.0)
+
+        # 🔥 REPLACE WITH YOUR REAL COEFFS FROM NOTEBOOK
+        # Example placeholder:
+        return 3.0 + 1.2*s - 0.3*np.exp(-5*s) + 0.1*np.exp(-5*(1 - s))
+
+    # ================= INITIAL STATES =================
+    current_soc = soc
+    current_temp = temp
+    V_RC = 0.0
+    prev_volt = ocv_function(current_soc) - I * R0
 
     rows = []
+
     for t in range(seq_len):
-        noise = np.random.normal(0, 0.001, 8)
+
+        # -------- SOC update --------
+        current_soc -= (I * dt) / (3600.0 * Q_actual)
+        current_soc = np.clip(current_soc, 0.0, 1.0)
+
+        # -------- RC dynamics --------
+        alpha = np.exp(-dt / (R1 * C1))
+        V_RC = alpha * V_RC + R1 * (1 - alpha) * I
+
+        # -------- Voltage --------
+        OCV = ocv_function(current_soc)
+        V_ecm = OCV - I * R0 - V_RC
+
+        # -------- Temperature --------
+        heat_gen = (I ** 2) * R0
+        heat_loss = (current_temp - 25.0) / 2.0
+        dT = (dt / 400.0) * (heat_gen - heat_loss)
+        current_temp += dT
+
+        # -------- Derivatives --------
+        dV_dt = V_ecm - prev_volt
+        dT_dt = dT
+        power = V_ecm * I
+
+        prev_volt = V_ecm
+
+        # small noise for realism (very small)
+        noise = np.random.normal(0, 0.0005, 8)
+
         row = np.array([
-            volt  + noise[0],          # Voltage_measured
-            curr  + noise[1],          # Current_measured
-            noise[2],                  # dV_dt
-            noise[3],                  # dT_dt
-            0.0   + noise[4],          # V_RC_masked (discharge only)
-            0.0   + noise[5],          # V_ECM_masked
-            volt * curr + noise[6],    # power
-            temp  + noise[7],          # Temperature_measured
+            V_ecm + noise[0],        # Voltage_measured
+            I     + noise[1],        # Current_measured
+            dV_dt + noise[2],        # dV_dt
+            dT_dt + noise[3],        # dT_dt
+            V_RC  + noise[4],        # V_RC_masked
+            V_ecm + noise[5],        # V_ECM_masked
+            power + noise[6],        # power
+            current_temp + noise[7], # Temperature
         ])
+
         rows.append(row)
 
-    data = np.stack(rows)  # (seq_len, 8)
+    data = np.stack(rows)
 
-    # normalise the 8 numeric cols
+    # ================= NORMALIZATION =================
     mean_vals = global_mean[num_cols].values
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    # extra features (not normalised)
-    mode_flag   = 1.0 if curr < 0 else 0.0
-    time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
-    cycle_index  = np.full((seq_len, 1), battery_input.get("cycle_norm", 0.5))
+    # ================= EXTRA FEATURES =================
+    mode_flag    = 1.0 if I < 0 else 0.0
     mode_col     = np.full((seq_len, 1), mode_flag)
+    time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
+    cycle_index  = np.full((seq_len, 1), cycle)
 
-    # final feature order matches BatteryDataset:
-    # Voltage, Current, Time_uniform, dV_dt, dT_dt,
-    # mode_flag, V_RC_masked, V_ECM_masked, power, cycle_index, Temperature
+    # ================= FINAL FEATURES =================
     features = np.concatenate([
-        data_norm[:, 0:1],   # Voltage_measured
-        data_norm[:, 1:2],   # Current_measured
-        time_uniform,        # Time_uniform
-        data_norm[:, 2:3],   # dV_dt
-        data_norm[:, 3:4],   # dT_dt
-        mode_col,            # mode_flag
-        data_norm[:, 4:5],   # V_RC_masked
-        data_norm[:, 5:6],   # V_ECM_masked
-        data_norm[:, 6:7],   # power
-        cycle_index,         # cycle_index
-        data_norm[:, 7:8],   # Temperature_measured
-    ], axis=1)               # (seq_len, 11)
+        data_norm[:, 0:1],
+        data_norm[:, 1:2],
+        time_uniform,
+        data_norm[:, 2:3],
+        data_norm[:, 3:4],
+        mode_col,
+        data_norm[:, 4:5],
+        data_norm[:, 5:6],
+        data_norm[:, 6:7],
+        cycle_index,
+        data_norm[:, 7:8],
+    ], axis=1)
 
     return features.astype(np.float32)
-
 
 def run_predictor(battery_input, model, global_mean, global_std, device):
     banner("AGENT 1 — PREDICTOR")
