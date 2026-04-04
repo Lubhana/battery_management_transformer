@@ -133,106 +133,113 @@ def ocv_function(s):
         c4*s +
         c5
     )
+
 def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
+    """
+    Builds a (seq_len, 11) feature tensor using ECM logic (from your notebook)
+    """
+
     num_cols = [
         'Voltage_measured', 'Current_measured', 'dV_dt', 'dT_dt',
         'V_RC_masked', 'V_ECM_masked', 'power', 'Temperature_measured'
     ]
 
     soc   = battery_input["soc"]
-    soh   = battery_input["soh"]
-    temp  = battery_input["temp_C"]      
-    curr  = battery_input["current_A"]   
+    soh   = battery_input.get("soh", 1.0)
+    temp  = battery_input["temp_C"]
+    curr  = battery_input["current_A"]   # ⚠️ KEEP RAW SIGN
+    cycle = battery_input.get("cycle_norm", 0.5)
 
-    # Base ECM parameters matched to ECM.ipynb
-    Q_rated = 2.3  
+    # ================= ECM PARAMETERS =================
+    Q_rated = 2.3
     R1 = 0.01
     C1 = 2000.0
     dt = 1.0
 
     R0 = 0.02 * (1.0 / max(soh, 0.01))
     Q_actual = Q_rated * max(soh, 0.01)
-    I_load = -curr if curr < 0 else 0.0
 
-    # Your exact 5th-degree polynomial from ECM.ipynb
-    def ocv_function(s):
-        s = np.clip(s, 0.0, 1.0)
-        c0, c1, c2, c3, c4, c5 = 25.75752864, -85.18817968, 111.18268373, -70.79905435, 22.48912782, 0.53290648
-        return c0*(s**5) + c1*(s**4) + c2*(s**3) + c3*(s**2) + c4*s + c5
+    I = curr  # ✅ same convention as notebook
+    I= -curr if curr < 0 else 0.0  # Flips -1.5A to a positive 1.5A load
 
+    # ================= INITIAL STATES =================
     current_soc = soc
     current_temp = temp
     V_RC = 0.0
-    prev_volt = ocv_function(current_soc) - I_load * R0
+    prev_volt = ocv_function(current_soc) - I * R0
 
     rows = []
+
     for t in range(seq_len):
-        current_soc -= (I_load * dt) / (3600.0 * Q_actual)
+
+        # -------- SOC update --------
+        current_soc -= (I * dt) / (3600.0 * Q_actual)
         current_soc = np.clip(current_soc, 0.0, 1.0)
 
+        # -------- RC dynamics --------
         alpha = np.exp(-dt / (R1 * C1))
-        V_RC = alpha * V_RC + R1 * (1 - alpha) * I_load
+        V_RC = alpha * V_RC + R1 * (1 - alpha) * I
 
+        # -------- Voltage --------
         OCV = ocv_function(current_soc)
-        V_ecm = OCV - I_load * R0 - V_RC
+        V_ecm = OCV - I * R0 - V_RC
 
-        heat_gen = (curr ** 2) * R0
-        heat_loss = (current_temp - 25.0) / 2.0  
-        dT = (dt / 400.0) * (heat_gen - heat_loss) 
+        # -------- Temperature --------
+        heat_gen = (I ** 2) * R0
+        heat_loss = (current_temp - 25.0) / 2.0
+        dT = (dt / 400.0) * (heat_gen - heat_loss)
         current_temp += dT
 
+        # -------- Derivatives --------
         dV_dt = V_ecm - prev_volt
         dT_dt = dT
-        power = V_ecm * curr
+        power = V_ecm * I
+
         prev_volt = V_ecm
 
+        # small noise for realism (very small)
+        noise = np.random.normal(0, 0.0005, 8)
+
         row = np.array([
-            V_ecm,            
-            curr,             
-            dV_dt,            
-            dT_dt,            
-            V_RC,             
-            V_ecm,            
-            power,            
-            current_temp,     
+            V_ecm + noise[0],        # Voltage_measured
+            I     + noise[1],        # Current_measured
+            dV_dt + noise[2],        # dV_dt
+            dT_dt + noise[3],        # dT_dt
+            V_RC  + noise[4],        # V_RC_masked
+            V_ecm + noise[5],        # V_ECM_masked
+            power + noise[6],        # power
+            current_temp + noise[7], # Temperature
         ])
+
         rows.append(row)
 
-    data = np.stack(rows) 
+    data = np.stack(rows)
 
+    # ================= NORMALIZATION =================
     mean_vals = global_mean[num_cols].values
     std_vals  = global_std[num_cols].values
     data_norm = (data - mean_vals) / std_vals
 
-    mode_flag = 1.0 if curr < 0 else 0.0
-    mode_col  = np.full((seq_len, 1), mode_flag)
-    
-    # --- 1. THE TIME FIX (RAW SECONDS) ---
-    # Calculate how many seconds into the cycle we are based on current SoC
-    total_cycle_time = (Q_actual * 3600.0) / max(I_load, 0.1)
-    elapsed_seconds = total_cycle_time * (1.0 - soc)
-    time_uniform = np.arange(elapsed_seconds, elapsed_seconds + seq_len * dt, dt).reshape(-1, 1)
-    
-    # --- 2. THE INVERSE SOH FIX (HEALTH -> AGE) ---
-    # Map SoH (1.0 -> 0.70) to Cycle Age (0.0 -> 1.0)
-    # If SoH is 1.0 (new), age = 0.0. If SoH is 0.7 (old), age = 1.0.
-    cycle_age = (1.0 - soh) / 0.30
-    cycle_age = np.clip(cycle_age, 0.0, 1.0)
-    cycle_index = np.full((seq_len, 1), cycle_age)
-    
+    # ================= EXTRA FEATURES =================
+    mode_flag    = 1.0 if I < 0 else 0.0
+    mode_col     = np.full((seq_len, 1), mode_flag)
+    time_uniform = np.linspace(0, 1, seq_len).reshape(-1, 1)
+    cycle_index  = np.full((seq_len, 1), cycle)
+
+    # ================= FINAL FEATURES =================
     features = np.concatenate([
-        data_norm[:, 0:1],   
-        data_norm[:, 1:2],   
-        time_uniform,        
-        data_norm[:, 2:3],   
-        data_norm[:, 3:4],   
-        mode_col,            
-        data_norm[:, 4:5],   
-        data_norm[:, 5:6],   
-        data_norm[:, 6:7],   
-        cycle_index,         
-        data_norm[:, 7:8],   
-    ], axis=1)               
+        data_norm[:, 0:1],
+        data_norm[:, 1:2],
+        time_uniform,
+        data_norm[:, 2:3],
+        data_norm[:, 3:4],
+        mode_col,
+        data_norm[:, 4:5],
+        data_norm[:, 5:6],
+        data_norm[:, 6:7],
+        cycle_index,
+        data_norm[:, 7:8],
+    ], axis=1)
 
     return features.astype(np.float32)
 
