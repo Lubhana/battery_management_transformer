@@ -160,7 +160,7 @@ def build_input_sequence(battery_input, global_mean, global_std, seq_len=64):
     Q_actual = Q_rated * max(soh, 0.01)
 
     I = curr  # ✅ same convention as notebook
-
+    I= -curr if curr < 0 else 0.0  # Flips -1.5A to a positive 1.5A load
 
     # ================= INITIAL STATES =================
     current_soc = soc
