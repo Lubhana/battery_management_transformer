@@ -805,7 +805,7 @@ def compute_metrics(policy):
 
 def kill_agent(policy_metrics, battery_state,
                peak_temp_limit=320, temp_rise_limit=5,
-               soh_loss_limit=0.001, health_limit=0.80,
+               soh_loss_limit=0.001, health_limit=0.60,
                high_temp_limit=5, confidence_limit=0.5):
 
     checks = []
