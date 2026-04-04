@@ -33,10 +33,10 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS  — edit these to match your Kaggle/local environment
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_PATH   = '/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/multihead-attention-transformer/best_model.pt'
-GLOBALS_PATH = '/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/linking/BMS/codes/predictor_globals.pkl'
-DATASET_PATH = '/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/linking/BMS/codes/nsga2_synthetic_dataset.csv'
-DATA_DIR     ='/Users/lubhanamutha/Desktop/atml_project copy/agentic-ai-battery-health-management-systems/NASA/ECM_processed_cycles'
+MODEL_PATH   = 'models/best_model.pt'
+GLOBALS_PATH = 'models/predictor_globals.pkl'
+DATASET_PATH = 'dataset/nsga2_synthetic_dataset.csv'
+DATA_DIR     ='dataset/ECM_processed_cycles'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
