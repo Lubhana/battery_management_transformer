@@ -64,7 +64,6 @@ GLOBALS_PATH = "models/predictor_globals.pkl"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_model_and_globals(model_path, globals_path, device):
-    """Cache model loading so it doesn't reload on every rerun."""
     model = BatteryTransformer(input_dim=11).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -74,18 +73,10 @@ def load_model_and_globals(model_path, globals_path, device):
 
 
 def make_line_df(values, col_name):
-    """
-    Wrap a 1-D array into a single-column DataFrame.
-    st.line_chart / add_rows needs a DataFrame or dict, not a bare list.
-    """
     return pd.DataFrame({col_name: [values] if np.isscalar(values) else values})
 
 
 def stream_charts(policy_data, batch=10):
-    """
-    Stream SoC / Temp / Current charts in batches to avoid blocking the
-    Streamlit event loop with thousands of individual add_rows calls.
-    """
     n = len(policy_data["soc"])
 
     chart_col1, chart_col2, chart_col3 = st.columns(3)
@@ -112,13 +103,48 @@ def stream_charts(policy_data, batch=10):
 
     for i in range(1, n, batch):
         end = min(i + batch, n)
-        soc_chart.add_rows(make_line_df(policy_data["soc"][i:end],   "SoC"))
-        temp_chart.add_rows(make_line_df(policy_data["temp"][i:end],  "Temp (K)"))
-        curr_chart.add_rows(make_line_df(policy_data["current"][i:end], "Current (A)"))
+        soc_chart.add_rows(make_line_df(policy_data["soc"][i:end],     "SoC"))
+        temp_chart.add_rows(make_line_df(policy_data["temp"][i:end],   "Temp (K)"))
+        curr_chart.add_rows(make_line_df(policy_data["current"][i:end],"Current (A)"))
         progress.progress(end / n)
         time.sleep(0.05)
 
     progress.empty()
+
+
+def layman_battery_grade(soh):
+    if soh >= 0.95:
+        return "🟢 Excellent", "Your battery is almost brand new."
+    elif soh >= 0.85:
+        return "🟢 Good", "Your battery is in great shape with plenty of life left."
+    elif soh >= 0.75:
+        return "🟡 Fair", "Your battery is aging but still functional."
+    elif soh >= 0.60:
+        return "🟠 Poor", "Your battery has significant wear — consider monitoring closely."
+    else:
+        return "🔴 Critical", "Your battery is heavily degraded and may need replacement soon."
+
+
+def layman_charge_level(soc):
+    if soc >= 0.80:
+        return "nearly full"
+    elif soc >= 0.50:
+        return "half full"
+    elif soc >= 0.25:
+        return "getting low"
+    else:
+        return "almost empty"
+
+
+def layman_temp(temp_c):
+    if temp_c < 15:
+        return "cold (which slightly reduces performance)"
+    elif temp_c <= 35:
+        return "normal"
+    elif temp_c <= 45:
+        return "warm (safe but worth watching)"
+    else:
+        return "hot (this can accelerate battery wear)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,7 +152,6 @@ def stream_charts(policy_data, batch=10):
 # ─────────────────────────────────────────────────────────────────────────────
 if st.sidebar.button("Run Simulation", type="primary"):
 
-    # ── pre-flight checks ────────────────────────────────────────────────────
     if not os.path.exists(MODEL_PATH) or not os.path.exists(GLOBALS_PATH):
         st.error(
             f"Missing model files. "
@@ -136,7 +161,6 @@ if st.sidebar.button("Run Simulation", type="primary"):
 
     device = torch.device("cpu")
 
-    # ── load (cached inside the button block so it only runs when needed) ────
     with st.spinner("Loading model weights…"):
         try:
             model, global_mean, global_std = load_model_and_globals(
@@ -151,7 +175,7 @@ if st.sidebar.button("Run Simulation", type="primary"):
         "soh":        soh,
         "temp_C":     temp,
         "current_A":  current,
-        "cycle_norm": cycle_norm,   # FIX: was hardcoded 0.5
+        "cycle_norm": cycle_norm,
     }
 
     # ── Agent 1: Predictor ───────────────────────────────────────────────────
@@ -167,7 +191,9 @@ if st.sidebar.button("Run Simulation", type="primary"):
     # ── Agent 2: Simulator + Optimiser ───────────────────────────────────────
     with st.spinner("Agent 2 — Simulator & Optimiser running…"):
         try:
-            df, transformer_state = run_simulator_optimiser(predictor_output,battery_input)
+            df, transformer_state, nsga_info = run_simulator_optimiser(
+                predictor_output, battery_input
+            )
             transformer_state["confidence"] = predictor_output["confidence"]
         except Exception as e:
             st.error(f"Simulator failed: {e}")
@@ -209,9 +235,6 @@ if st.sidebar.button("Run Simulation", type="primary"):
 
     # ── top metrics ──────────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
-
-    # FIX: show both the user's input value AND the AI's prediction so the
-    # user can see how far the model deviated from the slider input.
     col1.metric(
         "Predicted SoC",
         f"{predictor_output['soc']:.2%}",
@@ -235,7 +258,6 @@ if st.sidebar.button("Run Simulation", type="primary"):
         f"{predictor_output['confidence']:.2%}",
     )
 
-    # ── confidence warning ───────────────────────────────────────────────────
     if predictor_output["confidence"] < 0.5:
         st.warning(
             "⚠️ Model confidence is low (<50%). "
@@ -243,7 +265,6 @@ if st.sidebar.button("Run Simulation", type="primary"):
             "Predictions should be treated with caution."
         )
 
-    # ── per-target confidences ────────────────────────────────────────────────
     with st.expander("Per-target confidence breakdown"):
         cc1, cc2, cc3 = st.columns(3)
         cc1.metric("SoC confidence",  f"{predictor_output['soc_conf']:.2%}")
@@ -252,7 +273,6 @@ if st.sidebar.button("Run Simulation", type="primary"):
 
     # ── kill agent status ────────────────────────────────────────────────────
     st.subheader("🛡️ Kill Agent Status")
-
     decision_text = decision["decision"].upper()
     if decision["decision"] == "allow":
         st.success(f"✅ **{decision_text}** — {decision['reason']}")
@@ -262,24 +282,100 @@ if st.sidebar.button("Run Simulation", type="primary"):
         st.error(f"🚨 **{decision_text}** — {decision['reason']}")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # NSGA-II OPTIMISER EXPLAINER
+    # ─────────────────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🧬 Optimisation Engine — What Happened Under the Hood")
+
+    with st.expander("How the AI found the best charging strategy — click to expand", expanded=True):
+        ni = nsga_info
+
+        if ni["source"] == "cached":
+            st.info(
+                f"**Pre-computed profiles loaded from cache.** "
+                f"The simulator found {ni['n_solutions']} ready-to-use charging strategies "
+                f"from a previous NSGA-II run and loaded them instantly."
+            )
+        else:
+            st.success(
+                f"**Fresh optimisation completed.** "
+                f"The AI ran {ni['algorithm']} and discovered "
+                f"**{ni['n_solutions']} optimal charging strategies** for your battery."
+            )
+
+        st.markdown("#### What is NSGA-II?")
+        st.markdown(
+            """
+**NSGA-II** (Non-dominated Sorting Genetic Algorithm II) is an evolutionary optimiser —
+it works a bit like natural selection, but for charging strategies.
+
+Here's how it works in plain English:
+
+1. **Start with random strategies** — the AI generates 60 random charging profiles (different
+   patterns of how much current to apply over 20 minutes).
+
+2. **Simulate each one** — every strategy is run through a physics model of your battery
+   (the ECM) to see what would actually happen: how much charge you'd gain, how hot it gets,
+   and how much wear it causes.
+
+3. **Survival of the fittest** — strategies that are unsafe, too hot, or too damaging get
+   discarded. The better ones survive and are "bred" together to create new strategies.
+
+4. **Repeat for 40 generations** — after 40 rounds of this, the AI has a set of
+   strategies that represent the best possible trade-offs.
+
+5. **The Pareto front** — rather than picking just one "winner", NSGA-II keeps a whole
+   *family* of optimal strategies — some charge faster, some are gentler on the battery,
+   and some balance both. This family is called the **Pareto front**.
+            """
+        )
+
+        st.markdown("#### The 3 goals it balanced simultaneously")
+        g1, g2, g3 = st.columns(3)
+        g1.info("⚡ **Maximise SoC Gain**\nCharge as much as possible in the time window.")
+        g2.info("🌡️ **Minimise Peak Temperature**\nKeep the battery cool to avoid thermal stress.")
+        g3.info("🔋 **Minimise SoH Loss**\nCause as little wear as possible per charge cycle.")
+
+        if ni["source"] == "fresh" and ni["soc_gain_range"]:
+            st.markdown("#### What the Pareto front looked like")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("SoC gain range",
+                      f"{ni['soc_gain_range'][0]:.3f} → {ni['soc_gain_range'][1]:.3f}")
+            r2.metric("Peak temp range",
+                      f"{ni['peak_temp_range'][0]:.1f} K → {ni['peak_temp_range'][1]:.1f} K")
+            r3.metric("SoH loss range",
+                      f"{ni['soh_loss_range'][0]:.6f} → {ni['soh_loss_range'][1]:.6f}")
+            st.caption(
+                "Each number shows the spread across all Pareto-optimal strategies. "
+                "The Meta-Agent then picked the one best suited to your battery's current state."
+            )
+
+        st.markdown(
+            f"**Run config:** {ni['algorithm']} · "
+            f"{ni['pop_size']} individuals · "
+            f"{ni['generations']} generations · "
+            f"{ni['objectives']} objectives · "
+            f"{ni['n_solutions']} Pareto-optimal solutions"
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
     # LIFECYCLE, RUL & CHARTS
     # ─────────────────────────────────────────────────────────────────────────
     if final_policy is not None:
         policy_data  = extract_policy(df, final_policy)
         metrics      = compute_metrics(policy_data)
 
-        soh_loss_per_cycle   = metrics["soh_loss"]
-        current_soh          = predictor_output["soh"]
+        soh_loss_per_cycle    = metrics["soh_loss"]
+        current_soh           = predictor_output["soh"]
         end_of_life_threshold = 0.80
 
         st.subheader("🔋 Lifecycle & RUL Analysis")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Selected Policy ID",     int(final_policy))
-        c2.metric("SoC Gain",               f"{metrics['soc_gain']:.4f}")
-        c3.metric("Cycle SoH Degradation",  f"{soh_loss_per_cycle:.6f}")
-        c4.metric("Peak Temperature",       f"{metrics['peak_temp']:.1f} K")
+        c1.metric("Selected Policy ID",    int(final_policy))
+        c2.metric("SoC Gain",              f"{metrics['soc_gain']:.4f}")
+        c3.metric("Cycle SoH Degradation", f"{soh_loss_per_cycle:.6f}")
+        c4.metric("Peak Temperature",      f"{metrics['peak_temp']:.1f} K")
 
-        # RUL
         st.divider()
         rul_col1, rul_col2 = st.columns([1, 2])
         with rul_col1:
@@ -293,20 +389,14 @@ if st.sidebar.button("Run Simulation", type="primary"):
                     help="Cycles remaining until SoH hits 80% (end-of-life threshold)",
                 )
             else:
-                projected_rul = None 
+                projected_rul = None
                 st.metric("Estimated RUL", "∞ — No measurable damage")
 
         with rul_col2:
-            # Mini SoH degradation projection chart
             if soh_loss_per_cycle > 1e-9:
-                if projected_rul is not None:
-                    max_cycles = min(projected_rul + 50, 5000)
-                else:
-                    max_cycles = 5000
-            
+                max_cycles  = min(projected_rul + 50, 5000) if projected_rul else 5000
                 cycle_range = np.arange(0, max_cycles, max(1, max_cycles // 200))
-                soh_proj    = current_soh - soh_loss_per_cycle * cycle_range
-                soh_proj    = np.clip(soh_proj, 0, 1)
+                soh_proj    = np.clip(current_soh - soh_loss_per_cycle * cycle_range, 0, 1)
                 proj_df     = pd.DataFrame({"Projected SoH": soh_proj}, index=cycle_range)
                 st.markdown("**SoH Degradation Projection**")
                 st.line_chart(proj_df, height=150, color="#00cc88")
@@ -316,13 +406,128 @@ if st.sidebar.button("Run Simulation", type="primary"):
         st.subheader("📈 Live Charging Simulation")
         stream_charts(policy_data, batch=20)
 
+        # ─────────────────────────────────────────────────────────────────────
+        # LAYMAN SUMMARY
+        # ─────────────────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("📋 Plain-English Summary")
+        st.markdown("*Everything the simulation just did, explained simply.*")
+
+        battery_grade, grade_desc = layman_battery_grade(predictor_output["soh"])
+        charge_level  = layman_charge_level(predictor_output["soc"])
+        temp_desc     = layman_temp(predictor_output["temperature"])
+        conf_pct      = predictor_output["confidence"]
+        decision_word = decision["decision"]
+
+        # ── Battery health card ──
+        with st.container(border=True):
+            st.markdown(f"### {battery_grade} — Battery Health")
+            st.markdown(
+                f"{grade_desc} The AI estimates your battery's health (SoH) at "
+                f"**{predictor_output['soh']:.1%}**, meaning it can hold "
+                f"**{predictor_output['soh']:.1%} of its original capacity** compared "
+                f"to when it was new."
+            )
+            if predictor_output.get("ood"):
+                st.warning(
+                    "⚠️ The AI flagged your battery inputs as unusual — "
+                    "a combination it wasn't trained on. It played it safe and used "
+                    "your raw input values directly instead of making a potentially "
+                    "unreliable prediction."
+                )
+
+        # ── Current state card ──
+        with st.container(border=True):
+            st.markdown("### 🔌 Current Battery State")
+            st.markdown(
+                f"Right now your battery is **{charge_level}** "
+                f"({predictor_output['soc']:.1%} charged) and running at a "
+                f"**{temp_desc}** temperature of {predictor_output['temperature']:.1f} °C."
+            )
+            if conf_pct >= 0.75:
+                conf_text = "The AI is **highly confident** in these readings."
+            elif conf_pct >= 0.5:
+                conf_text = "The AI has **moderate confidence** in these readings — treat them as a good estimate."
+            else:
+                conf_text = ("⚠️ The AI has **low confidence** in these readings. "
+                             "Your battery may be in an unusual state the model hasn't seen before.")
+            st.markdown(conf_text)
+
+        # ── Charging decision card ──
+        with st.container(border=True):
+            st.markdown("### ⚡ Charging Decision")
+            if decision_word == "allow":
+                st.success(
+                    f"**Charging is safe to proceed.** The AI reviewed the best strategy "
+                    f"(Policy #{int(final_policy)}) and found no safety concerns. "
+                    f"It will charge your battery by approximately "
+                    f"**{metrics['soc_gain']:.1%}** during this session."
+                )
+            elif decision_word == "override":
+                st.warning(
+                    f"**The original strategy was adjusted.** The AI's safety agent "
+                    f"detected a potential issue ({decision['reason']}) and automatically "
+                    f"switched to a safer, gentler charging profile "
+                    f"(Policy #{int(final_policy)})."
+                )
+            else:
+                st.error(
+                    "**Charging was stopped.** The safety agent determined that no "
+                    "available charging strategy was safe enough for your battery's "
+                    f"current condition ({decision['reason']}). "
+                    "It's best not to charge right now."
+                )
+
+        # ── Wear & longevity card ──
+        with st.container(border=True):
+            st.markdown("### 🕰️ Battery Wear This Session")
+            wear_pct = soh_loss_per_cycle * 100
+            st.markdown(
+                f"This charging session will use up roughly **{wear_pct:.4f}%** "
+                f"of your battery's total lifetime health — an extremely small amount."
+            )
+            if projected_rul is not None:
+                st.markdown(
+                    f"At this rate, your battery has approximately "
+                    f"**{projected_rul:,} charge cycles remaining** before it drops "
+                    f"below 80% of its original capacity, which is the standard "
+                    f"end-of-life point for most lithium-ion batteries."
+                )
+                if projected_rul > 1000:
+                    longevity = "That's a very healthy lifespan — your battery should last a long time."
+                elif projected_rul > 300:
+                    longevity = "That's a reasonable lifespan for a battery at this health level."
+                else:
+                    longevity = "The battery is nearing end-of-life and may need replacement relatively soon."
+                st.markdown(longevity)
+            else:
+                st.markdown(
+                    "The damage this session is so small it's essentially **unmeasurable**. "
+                    "Your battery is in excellent shape."
+                )
+
+        # ── Temperature card ──
+        with st.container(border=True):
+            st.markdown("### 🌡️ Temperature During Charging")
+            peak_k = metrics["peak_temp"]
+            peak_c = peak_k - 273.15
+            if peak_c <= 35:
+                temp_verdict = "✅ The battery stayed **cool throughout** — ideal charging conditions."
+            elif peak_c <= 45:
+                temp_verdict = "🟡 The battery got **moderately warm** — within safe limits but worth monitoring."
+            else:
+                temp_verdict = "🔴 The battery got **quite hot** during charging — this can accelerate wear over time."
+            st.markdown(
+                f"The peak temperature reached during this charging session was "
+                f"**{peak_c:.1f} °C** ({peak_k:.1f} K). {temp_verdict}"
+            )
+
     else:
+        # ── Abort path ───────────────────────────────────────────────────────
         st.error(
             "🚨 Charging Aborted by Kill Agent. "
             "No safe policy could be found for the current battery state."
         )
-
-        # Still show the predictor output summary even on abort
         st.info(
             f"**Predictor summary:** "
             f"SoC={predictor_output['soc']:.2%}, "
@@ -330,3 +535,22 @@ if st.sidebar.button("Run Simulation", type="primary"):
             f"Temp={predictor_output['temperature']:.1f}°C, "
             f"Confidence={predictor_output['confidence']:.2%}"
         )
+
+        # Layman abort summary
+        st.divider()
+        st.subheader("📋 Plain-English Summary")
+        battery_grade, grade_desc = layman_battery_grade(predictor_output["soh"])
+        with st.container(border=True):
+            st.markdown(f"### {battery_grade} — Why Charging Was Stopped")
+            st.markdown(
+                f"{grade_desc} However, the AI's safety system determined that "
+                f"**none of the available charging strategies were safe enough** "
+                f"for your battery in its current state.\n\n"
+                f"This can happen when the battery is very degraded, extremely hot, "
+                f"or in an unusual condition the AI hasn't encountered before. "
+                f"The system chose to do nothing rather than risk damaging your battery further."
+            )
+            st.markdown(
+                "**What you can do:** Let the battery cool down, check that your "
+                "input values are correct, or consult a battery health diagnostic tool."
+            )
