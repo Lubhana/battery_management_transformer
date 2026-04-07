@@ -167,7 +167,7 @@ if st.sidebar.button("Run Simulation", type="primary"):
     # ── Agent 2: Simulator + Optimiser ───────────────────────────────────────
     with st.spinner("Agent 2 — Simulator & Optimiser running…"):
         try:
-            df, transformer_state = run_simulator_optimiser(predictor_output)
+            df, transformer_state = run_simulator_optimiser(predictor_output,battery_input)
             transformer_state["confidence"] = predictor_output["confidence"]
         except Exception as e:
             st.error(f"Simulator failed: {e}")
