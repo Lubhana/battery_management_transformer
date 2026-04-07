@@ -841,7 +841,19 @@ def run_simulator_optimiser(predictor_output, battery_input):
     if os.path.exists(DATASET_PATH):
         section("Loading existing nsga2_synthetic_dataset.csv")
         df = pd.read_csv(DATASET_PATH)
-        print(f"  Loaded {len(df):,} rows | {df['solution_id'].nunique()} solutions")
+        n_solutions = df['solution_id'].nunique()
+        print(f"  Loaded {len(df):,} rows | {n_solutions} solutions")
+        nsga_info = {
+            "source":      "cached",
+            "n_solutions": n_solutions,
+            "algorithm":   "NSGA-II",
+            "pop_size":    60,
+            "generations": 40,
+            "objectives":  3,
+            "soc_gain_range":  None,
+            "peak_temp_range": None,
+            "soh_loss_range":  None,
+        }
     else:
         section("GA optimisation")
         best_ga = run_ga(transformer_state)
@@ -856,17 +868,30 @@ def run_simulator_optimiser(predictor_output, battery_input):
         soc_gains  = -pareto_F[:, 0]
         peak_temps =  pareto_F[:, 1]
         soh_losses =  pareto_F[:, 2]
-        print(f"  Pareto front: {len(pareto_profiles)} solutions")
+        n_solutions = len(pareto_profiles)
+        print(f"  Pareto front: {n_solutions} solutions")
         print(f"    SoC gain range  : {soc_gains.min():.4f} — {soc_gains.max():.4f}")
         print(f"    Peak temp range : {peak_temps.min():.2f} — {peak_temps.max():.2f} K")
         print(f"    SoH loss range  : {soh_losses.min():.6f} — {soh_losses.max():.6f}")
+
+        nsga_info = {
+            "source":      "fresh",
+            "n_solutions": n_solutions,
+            "algorithm":   "NSGA-II",
+            "pop_size":    60,
+            "generations": 40,
+            "objectives":  3,
+            "soc_gain_range":  (float(soc_gains.min()),  float(soc_gains.max())),
+            "peak_temp_range": (float(peak_temps.min()), float(peak_temps.max())),
+            "soh_loss_range":  (float(soh_losses.min()), float(soh_losses.max())),
+        }
 
         section("Building synthetic dataset")
         df = build_synthetic_dataset(pareto_profiles, transformer_state)
         df.to_csv(DATASET_PATH, index=False)
         print(f"  Saved {len(df):,} rows → {DATASET_PATH}")
 
-    return df, transformer_state
+    return df, transformer_state, nsga_info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1215,7 +1240,7 @@ def main():
     )
 
     # battery_input passed through so the simulator can use the raw sensor temp
-    df, transformer_state = run_simulator_optimiser(predictor_output, battery_input)
+    df, transformer_state, nsga_info = run_simulator_optimiser(predictor_output, battery_input)
     transformer_state["confidence"] = predictor_output["confidence"]
 
     selected_policy, policies, metrics_df, policy_choices = run_meta_agent(
