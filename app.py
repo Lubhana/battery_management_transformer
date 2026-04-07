@@ -282,6 +282,82 @@ if st.sidebar.button("Run Simulation", type="primary"):
         st.error(f"🚨 **{decision_text}** — {decision['reason']}")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # META-AGENT DECISION — which policy was picked and why
+    # ─────────────────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🤖 Meta-Agent Decision")
+
+    # Figure out which named bucket (fast/balanced/gentle) was selected
+    policy_name = None
+    for name, pid in policy_choices.items():
+        if pid == selected_policy:
+            policy_name = name
+            break
+    policy_name = policy_name or "custom"
+
+    # Pull that policy's metrics for display
+    sel_row = metrics_df[metrics_df["solution_id"] == selected_policy].iloc[0]
+
+    policy_icons = {"fast": "⚡", "balanced": "⚖️", "gentle": "🌿"}
+    policy_descs = {
+        "fast":     "Charges as quickly as possible. Best when SoC is very low and the battery is healthy.",
+        "balanced": "A middle-ground strategy — reasonable charge speed with moderate wear.",
+        "gentle":   "Slow and careful charging. Prioritises battery longevity over speed.",
+    }
+    icon = policy_icons.get(policy_name, "🔧")
+    desc = policy_descs.get(policy_name, "A custom strategy selected from the Pareto front.")
+
+    # Retrieve the reason string from meta_agent_select via metrics_df
+    # (re-derive it cleanly from transformer_state so we don't need to change the pipeline)
+    soc_val  = transformer_state["soc"]
+    soh_val  = transformer_state["soh"]
+    conf_val = transformer_state.get("confidence", 1.0)
+
+    if conf_val < 0.5:
+        derived_reason = f"Model confidence is low ({conf_val:.0%}) — the AI defaulted to the gentlest strategy to stay safe."
+    elif mode != "auto":
+        derived_reason = f"You manually selected **{mode}** mode, so the AI followed your instruction."
+    elif soh_val < 0.9:
+        derived_reason = f"Battery health (SoH) is {soh_val:.0%}, which is below 90% — the AI chose gentle to protect the degraded battery."
+    elif soc_val < 0.4 and soh_val >= 0.9:
+        derived_reason = f"Battery is low ({soc_val:.0%} charge) but healthy ({soh_val:.0%} SoH) — the AI chose fast to top it up quickly."
+    elif soc_val < 0.4 and soh_val < 0.9:
+        derived_reason = f"Battery is low ({soc_val:.0%} charge) AND somewhat degraded ({soh_val:.0%} SoH) — the AI balanced speed with care."
+    else:
+        derived_reason = "Battery is in a normal state with no special conditions — the AI defaulted to the balanced strategy."
+
+    dec_col1, dec_col2 = st.columns([1, 2])
+    with dec_col1:
+        st.markdown(f"### {icon} {policy_name.capitalize()} Charging")
+        st.markdown(desc)
+        st.markdown(f"**Policy ID selected:** `{int(selected_policy)}`")
+
+    with dec_col2:
+        st.info(f"**Why this strategy?**\n\n{derived_reason}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("SoC Gain",     f"{sel_row['soc_gain']:.4f}",
+                  help="How much charge this policy adds")
+        m2.metric("Peak Temp",    f"{sel_row['peak_temp']:.1f} K",
+                  help="Hottest the battery gets under this policy")
+        m3.metric("SoH Loss",     f"{sel_row['soh_loss']:.6f}",
+                  help="Battery wear caused by this charging session")
+
+    # Show all three candidate policies for comparison
+    with st.expander("Compare all three candidate strategies from the Pareto front"):
+        rows = []
+        for name, pid in policy_choices.items():
+            row = metrics_df[metrics_df["solution_id"] == pid].iloc[0]
+            rows.append({
+                "Strategy":   f"{policy_icons[name]} {name.capitalize()}",
+                "Policy ID":  int(pid),
+                "SoC Gain":   f"{row['soc_gain']:.4f}",
+                "Peak Temp (K)": f"{row['peak_temp']:.1f}",
+                "SoH Loss":   f"{row['soh_loss']:.6f}",
+                "Selected":   "✅" if pid == selected_policy else "",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # NSGA-II OPTIMISER EXPLAINER
     # ─────────────────────────────────────────────────────────────────────────
     st.divider()
